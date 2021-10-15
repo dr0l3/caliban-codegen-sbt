@@ -1,0 +1,8 @@
+directive @requires (
+    field: String!
+) on FIELD_DEFINITION
+directive @extended on OBJECT
+
+type users @extended {
+    address: String! @requires(field: "id")
+}
