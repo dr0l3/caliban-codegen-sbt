@@ -546,7 +546,7 @@ object ApiCreator {
         genericHandler(value)
       }
 
-      override def toType: __Type = ordersSchema.toType_()
+      override def toType: __Type = Util.extendType(ordersSchema.toType_(), extensionLogicByType.keys.toList)
     }
 
 
@@ -555,7 +555,7 @@ object ApiCreator {
         genericHandler(value)
       }
 
-      override def toType: __Type = productSchema.toType_()
+      override def toType: __Type = Util.extendType(productSchema.toType_(), extensionLogicByType.keys.toList)
     }
 
 
@@ -564,7 +564,7 @@ object ApiCreator {
         genericHandler(value)
       }
 
-      override def toType: __Type = usersSchema.toType_()
+      override def toType: __Type = Util.extendType(usersSchema.toType_(), extensionLogicByType.keys.toList)
     }
 
 
@@ -869,8 +869,6 @@ object SuperApp extends App {
   val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
   implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
   import generated.Whatever._
-
-  val tables = connToTables(conn)
 
   val api = ApiCreator.createFederatedApi(conn, id => UIO(s"WOOO: $id"))
 

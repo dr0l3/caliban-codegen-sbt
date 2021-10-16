@@ -1272,7 +1272,7 @@ object PostgresSniffer {
            |        genericHandler(value)
            |      }
            |
-           |  override def toType: __Type = ${table.name}Schema.toType_()
+           |  override def toType: __Type = Util.extendType(${table.name}Schema.toType_(), extensionLogicByType.keys.toList)
            |}
            |""".stripMargin
       }
