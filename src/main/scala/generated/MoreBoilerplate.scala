@@ -16,7 +16,6 @@ import caliban.federation.tracing.ApolloFederatedTracing
 import caliban.federation.{EntityResolver, federate}
 import caliban.wrappers.Wrapper
 import cats.data.Kleisli
-import codegen.Runner.{api, query}
 import codegen.{ArrayPath, ArrayPathWrapper, Column, ExportedKeyInfo, Intermediate, IntermediateFrom, IntermediateJoin, JsonPathPart, ObejctPathWrapper, ObjectExtension, ObjectExtensionField, ObjectPath, PathWrapper, Table, Util}
 import com.sun.xml.internal.bind.v2.TODO
 import fs2.Stream
@@ -377,12 +376,19 @@ object Util {
     }
   }
 
-  def doesntReallyMatter(field: CField, extensions: Map[ObjectExtension, JsonObject => ZIO[Any,Nothing,JsonObject]]): List[Json => ZIO[Any, Nothing,Json]] = {
+  def doesntReallyMatter(field: CField, extensions: Map[ObjectExtension, JsonObject => ZIO[Any,Nothing,JsonObject]], entityQuery: Boolean): List[Json => ZIO[Any, Nothing,Json]] = {
     extensions.flatMap { case (extension, transformer) =>
       checkIfExtensionUsed(field, extension, Nil).map(path => path -> transformer)
     }.map { case (path, transformer) =>
-      println(s"PATH: $path has transformer")
-      createModification(transformer, path)
+
+      // TODO: Yet another case where calibans handling of federation causes us to need to use special cases
+      if(entityQuery) {
+        println(s"PATH: ${path.tail} has transformer. entityQyery:  $entityQuery")
+        createModification(transformer, path.tail)
+      } else {
+        println(s"PATH: ${path} has transformer. entityQyery:  $entityQuery")
+        createModification(transformer, path)
+      }
     }.toList
   }
 
@@ -526,7 +532,7 @@ object ApiCreator {
 
         val json = io.circe.parser.parse(resultJson).getOrElse(Json.Null)
 
-        val modificaitons = doesntReallyMatter(field, extensionLogicByType)
+        val modificaitons = doesntReallyMatter(field, extensionLogicByType, true)
 
         val modifiedJson = modificaitons.foldLeft(ZIO.succeed(json)){ (acc, next) =>
           acc.flatMap(next(_))
@@ -625,7 +631,7 @@ object ApiCreator {
 
             val json = io.circe.parser.parse(resultJson).getOrElse(Json.Null)
 
-            val modificaitons = doesntReallyMatter(field, extensionLogicByType)
+            val modificaitons = doesntReallyMatter(field, extensionLogicByType, false)
 
             val modifiedJson = modificaitons.foldLeft(ZIO.succeed(json)){ (acc, next) =>
               acc.flatMap(next(_))
@@ -751,7 +757,7 @@ object ApiCreator2 {
 
         val json = io.circe.parser.parse(resultJson).getOrElse(Json.Null)
 
-        val modificaitons = doesntReallyMatter(field, extensionLogicByType)
+        val modificaitons = doesntReallyMatter(field, extensionLogicByType, true)
 
         val modifiedJson = modificaitons.foldLeft(ZIO.succeed(json)){ (acc, next) =>
           acc.flatMap(next(_))
@@ -827,7 +833,7 @@ object ApiCreator2 {
 
             val json = io.circe.parser.parse(resultJson).getOrElse(Json.Null)
 
-            val modificaitons = doesntReallyMatter(field, extensionLogicByType)
+            val modificaitons = doesntReallyMatter(field, extensionLogicByType, false)
 
             val modifiedJson = modificaitons.foldLeft(ZIO.succeed(json)){ (acc, next) =>
               acc.flatMap(next(_))

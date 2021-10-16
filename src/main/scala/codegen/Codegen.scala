@@ -14,7 +14,7 @@ import caliban.parsing.{ParsedDocument, SourceMapper}
 import caliban.schema.Step.{MetadataFunctionStep, ObjectStep, PureStep}
 import caliban.schema.{Operation, RootSchemaBuilder, Schema, Step, Types}
 import caliban.wrappers.Wrapper
-import codegen.Runner.api
+//import codegen.Runner.api
 import fastparse.parse
 import generated.Whatever.{orders, users}
 import io.circe.optics.JsonPath.root
@@ -178,6 +178,24 @@ case class CaseClassType(name: String, fields: List[Field]) extends ScalaType {
       s"${field.name}: ${typeRendering}"
     }
     s"case class ${name}(${fieldRendering.mkString(",")})"
+  }
+
+  def renderWithFederation() = {
+    val fieldRendering = fields.map { field =>
+      val typeRendering = field.scalaType match {
+        case Concrete(scalaType) => scalaType.name
+        case Reference(scalaType) => scalaType().name
+      }
+      s"${field.name}: ${typeRendering}"
+    }
+
+    val keys = fields.filter(_.isPrimaryKey).map(_.name)
+
+    if(keys.nonEmpty) {
+      s"""@GQLDirective(Key("${keys.mkString(" ")}")) case class ${name}(${fieldRendering.mkString(",")})"""
+    } else {
+      s"""case class ${name}(${fieldRendering.mkString(",")})"""
+    }
   }
 }
 
@@ -955,11 +973,13 @@ object PostgresSniffer {
   }
 
   def toCalibanBoilerPlate(apis: List[TableAPI], extensions: List[ObjectExtension]) = {
-    val ops = apis.flatMap(api => api.delete.toList ++ api.insert.toList ++ api.update.toList ++ api.getById.toList)
+    val allOps = apis.flatMap(api => api.delete.toList ++ api.insert.toList ++ api.update.toList ++ api.getById.toList)
+    val readOps = apis.flatMap(api => api.getById.toList)
+    val writeOps = apis.flatMap(api => api.delete.toList ++ api.insert.toList ++ api.update.toList)
 
     // Model
 
-    val models = apis.map(api => api.caseClass.render).mkString("\n")
+    val models = apis.map(api => api.caseClass.renderWithFederation()).mkString("\n")
 
     // Args
     val opArgs = apis.flatMap(api => (api.delete.toList.flatMap(_.args) ++ api.insert.toList.flatMap(_.args) ++ api.update.toList.flatMap(_.args) ++ api.getById.toList.flatMap(_.args)).map(_.tpe).distinct)
@@ -974,23 +994,39 @@ object PostgresSniffer {
 
     // QueryRoot
     // TODO: Do something about tables with no
-    val renderedOps = ops.map { functionType =>
+    val renderedQueryOps = readOps.map { functionType =>
       val renderedReturnType = functionType.returnType.name
 
       if (functionType.args.isEmpty) s"${functionType.name}: ${renderedReturnType}"
       else {
         val renderedArgs = functionType.args.map(_.tpe.name)
-        s"${functionType.name}: (codegen.Field) =>  ${renderedArgs.mkString("(", ",", ")")} => ${renderedReturnType}"
+        s"${functionType.name}: (Field) =>  ${renderedArgs.mkString("(", ",", ")")} => ${renderedReturnType}"
       }
     }
     val queryRoot =
       s"""case class Queries (
-         |${renderedOps.map(str => s"\t$str").mkString(", \n")}
+         |${renderedQueryOps.map(str => s"\t$str").mkString(", \n")}
          |)""".stripMargin
+
+    val renderedMutationOps = writeOps.map { functionType =>
+      val renderedReturnType = functionType.returnType.name
+
+      if (functionType.args.isEmpty) s"${functionType.name}: ${renderedReturnType}"
+      else {
+        val renderedArgs = functionType.args.map(_.tpe.name)
+        s"${functionType.name}: (Field) =>  ${renderedArgs.mkString("(", ",", ")")} => ${renderedReturnType}"
+      }
+    }
+
+    val mutationRoot =
+      s"""case class Mutations(
+         |${renderedMutationOps.map(str => s"\t${str}").mkString(", \n")}
+         |)
+         |""".stripMargin
 
     // Schema Implicits
 
-    val outputTypes = apis.map(_.caseClass) ++ ops.map(_.returnType)
+    val outputTypes = apis.map(_.caseClass) ++ allOps.map(_.returnType)
 
     outputTypes.foreach(println)
 
@@ -1003,14 +1039,14 @@ object PostgresSniffer {
 
     // Argbuilder Implicits
 
-    val inputTypes = ops.flatMap(_.args.map(_.tpe)).flatMap { scalaType =>
+    val inputTypes = allOps.flatMap(_.args.map(_.tpe)).flatMap { scalaType =>
       scalaType match {
         case CaseClassType(name, fields) if fields.nonEmpty => Some(s"implicit val ${name.toLowerCase}Arg = ArgBuilder.gen[${name}]")
         case _ => None
       }
     }
 
-    val renderedServiceFunctions = ops.map { function =>
+    val renderedServiceFunctions = allOps.map { function =>
       val renderedFunctionArgs = List("field: codegen.Field") ++ function.args.map { arg =>
         s"${arg.name}: ${arg.tpe.name}"
       }
@@ -1032,10 +1068,11 @@ object PostgresSniffer {
          |val schema = new GenericSchema[ZIO${serviceName}]{}
          |import schema._
          |
-         | def buildApi(query: Queries) : GraphQL[Console with Clock with ZIO${serviceName}] =  {
+         | def buildApi(query: Queries, mutation: Mutations) : GraphQL[Console with Clock with ZIO${serviceName}] =  {
          |   val api = graphQL(
          |     RootResolver(
-         |       query
+         |       query,
+         |       mutation
          |     )
          |   )
          |   api
@@ -1048,9 +1085,11 @@ object PostgresSniffer {
     val imports =
       """import caliban._
         |import caliban.GraphQL.graphQL
-        |import caliban.execution.codegen.Field
+        |import caliban.execution.Field
         |import caliban.schema.{ArgBuilder, GenericSchema}
         |import caliban.schema.Schema.gen
+        |import caliban.schema.Annotations.GQLDirective
+        |import caliban.federation._
         |import zio.Has
         |import zio.clock.Clock
         |import zio.console.Console
@@ -1066,6 +1105,7 @@ object PostgresSniffer {
       }.map(_.render) ++
         List("// Arg code ") ++ argCode ++
         List("// QueryRoot ") ++ List(queryRoot) ++
+        List("// MutationRoot ") ++ List(mutationRoot) ++
 //        List("// Schema implicits ") ++ schemaImplicits ++
 //        List("// Arg Builder implicits ") ++ inputTypes ++
         List("// Service definition ") ++ List(serviceDefinition)
@@ -1737,127 +1777,127 @@ object Codegen extends App{
   val generatedBoilerPlate = tablesToBoilerplate(connToTables(conn), Nil)
 
 
-  //outputFile.toFile.writeAll("package generated \n",generatedBoilerPlate)
+  outputFile.toFile.writeAll("package generated \n",generatedBoilerPlate)
 
 }
 
-object Extensions extends App {
-  import PostgresSniffer._
-  val _ = classOf[org.postgresql.Driver]
-  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+//object Extensions extends App {
+//  import PostgresSniffer._
+//  val _ = classOf[org.postgresql.Driver]
+//  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
+//  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+//
+//  val tables = connToTables(conn)
+//
+//  val extensionDoc = parseDocument(parseExtensions())
+//  val extensions = docToObjectExtension(extensionDoc)
+//
+//  val baseApi = api.render
+//  val baseDoc = parseDocument(baseApi)
+//
+//  println(baseApi)
+//
+//  val isExtensionValid = checkExtensionValid(extensions, baseDoc)
+//  println(isExtensionValid)
+//
+//  println(toExtensionBoilerplate(tables, tablesToTableAPI(tables),extensions))
+//}
+//
+//object Poker extends App {
+//  import PostgresSniffer._
+//  val _ = classOf[org.postgresql.Driver]
+//  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
+//  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+//
+//  val metadata = conn.getMetaData
+//
+//
+//  val procedures = results(metadata.getProcedures(null, null, null))(extractProcedures)
+//
+//  println(s"PROCEDURES: ${procedures.size}")
+//
+//  val proceduresWithColumns = procedures.map { procedure =>
+//    procedure -> results(metadata.getProcedureColumns(null, null, procedure.name, null))(extractProcedureColumns)
+//  }
+//
+//  proceduresWithColumns.foreach { case (procedure, columns) =>
+//    println(s"Procedure: ${procedure.name}")
+//    columns.foreach { column =>
+//      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType}")
+//    }
+//  }
+//
+//  val functions = results(metadata.getFunctions(null, null, null))(extractFunctions)
+//
+//  println(s"FUNCTIONS: ${functions.size}")
+//
+//  val functionsWithColumns = functions.filter(_.name.contentEquals("user_extended_info")).map { function =>
+//    function -> results(metadata.getFunctionColumns(null, null, function.name, null))(extractFunctionColumns)
+//  }
+//
+//  functionsWithColumns.foreach { case (procedure, columns) =>
+//    println(s"Function: ${procedure.name}")
+//    columns.foreach { column =>
+//      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType} -> ${column.typeName}")
+//    }
+//  }
+//
+//}
 
-  val tables = connToTables(conn)
-
-  val extensionDoc = parseDocument(parseExtensions())
-  val extensions = docToObjectExtension(extensionDoc)
-
-  val baseApi = api.render
-  val baseDoc = parseDocument(baseApi)
-
-  println(baseApi)
-
-  val isExtensionValid = checkExtensionValid(extensions, baseDoc)
-  println(isExtensionValid)
-
-  println(toExtensionBoilerplate(tables, tablesToTableAPI(tables),extensions))
-}
-
-object Poker extends App {
-  import PostgresSniffer._
-  val _ = classOf[org.postgresql.Driver]
-  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
-
-  val metadata = conn.getMetaData
-
-
-  val procedures = results(metadata.getProcedures(null, null, null))(extractProcedures)
-
-  println(s"PROCEDURES: ${procedures.size}")
-
-  val proceduresWithColumns = procedures.map { procedure =>
-    procedure -> results(metadata.getProcedureColumns(null, null, procedure.name, null))(extractProcedureColumns)
-  }
-
-  proceduresWithColumns.foreach { case (procedure, columns) =>
-    println(s"Procedure: ${procedure.name}")
-    columns.foreach { column =>
-      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType}")
-    }
-  }
-
-  val functions = results(metadata.getFunctions(null, null, null))(extractFunctions)
-
-  println(s"FUNCTIONS: ${functions.size}")
-
-  val functionsWithColumns = functions.filter(_.name.contentEquals("user_extended_info")).map { function =>
-    function -> results(metadata.getFunctionColumns(null, null, function.name, null))(extractFunctionColumns)
-  }
-
-  functionsWithColumns.foreach { case (procedure, columns) =>
-    println(s"Function: ${procedure.name}")
-    columns.foreach { column =>
-      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType} -> ${column.typeName}")
-    }
-  }
-
-}
-
-import zio._
-object Runner extends App {
-  import PostgresSniffer._
-  val _ = classOf[org.postgresql.Driver]
-  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
-  import generated.Whatever._
-
-  val tables = connToTables(conn)
-
-  val api = doStuff2[Any, Queries](Nil,tables,conn)
-
-  val query =
-    """
-      |{
-      |  get_orders_by_id(id:"ebdc67f6-8925-4d98-948d-eb5042dc63fc") {
-      |    id
-      |    buyer
-      |    ordered_at
-      |    users {
-      |      id
-      |      name
-      |      age
-      |      email
-      |      address
-      |    }
-      |    lineitems {
-      |      product_id
-      |      amount
-      |      product {
-      |        upc
-      |        name
-      |        price
-      |        weight
-      |        review {
-      |          author
-      |          users {
-      |            id
-      |            name
-      |          }
-      |        }
-      |      }
-      |    }
-      |  }
-      |}
-      |""".stripMargin
-
-  override def run(args: List[String]): URIO[zio.ZEnv, ExitCode] = {
-    (for {
-
-    interpreter <- api.interpreter
-    res <- interpreter.execute(query)
-    _ = println(io.circe.parser.parse(res.data.toString).right.get.spaces4)
-//    _ = println(api.render)
-    } yield ()).exitCode
-  }
-}
+//import zio._
+//object Runner extends App {
+//  import PostgresSniffer._
+//  val _ = classOf[org.postgresql.Driver]
+//  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
+//  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+//  import generated.Whatever._
+//
+//  val tables = connToTables(conn)
+//
+//  val api = doStuff2[Any, Queries](Nil,tables,conn)
+//
+//  val query =
+//    """
+//      |{
+//      |  get_orders_by_id(id:"ebdc67f6-8925-4d98-948d-eb5042dc63fc") {
+//      |    id
+//      |    buyer
+//      |    ordered_at
+//      |    users {
+//      |      id
+//      |      name
+//      |      age
+//      |      email
+//      |      address
+//      |    }
+//      |    lineitems {
+//      |      product_id
+//      |      amount
+//      |      product {
+//      |        upc
+//      |        name
+//      |        price
+//      |        weight
+//      |        review {
+//      |          author
+//      |          users {
+//      |            id
+//      |            name
+//      |          }
+//      |        }
+//      |      }
+//      |    }
+//      |  }
+//      |}
+//      |""".stripMargin
+//
+//  override def run(args: List[String]): URIO[zio.ZEnv, ExitCode] = {
+//    (for {
+//
+//    interpreter <- api.interpreter
+//    res <- interpreter.execute(query)
+//    _ = println(io.circe.parser.parse(res.data.toString).right.get.spaces4)
+////    _ = println(api.render)
+//    } yield ()).exitCode
+//  }
+//}
