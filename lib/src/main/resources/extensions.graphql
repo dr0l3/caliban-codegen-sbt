@@ -3,6 +3,11 @@ directive @requires (
 ) on FIELD_DEFINITION
 directive @extended on OBJECT
 
+extend type User @key(fields: "id") {
+    id: ID! @external
+}
+
 type users @extended {
     address: String! @requires(field: "id")
+    user: User!
 }

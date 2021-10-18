@@ -36,7 +36,8 @@ trait DeleteInput {
 }
 
 object Util {
-  type ExtensionLogicMap = Map[ObjectExtension,Field => JsonObject => ZIO[Any,Throwable,JsonObject]]
+  case class ExtensionPosition(objectName: String, fieldName: String)
+  type ExtensionLogicMap = Map[ExtensionPosition,Field => JsonObject => ZIO[Any,Throwable,JsonObject]]
 
   def typeTo__Type(tpe: Type): __Type = {
     tpe match {
@@ -55,7 +56,7 @@ object Util {
   }
 
   def objectExtensionFieldToField(extension: ObjectExtensionField): __Field = {
-    __Field(extension.fieldName, None, Nil, () => typeTo__Type(extension.fieldType), false, None, None) // TODO FIX
+    __Field(extension.fieldName, None, Nil, () => extension.fieldType.to__Type, false, None, None) // TODO FIX
   }
 
   def checkExtensionApplies(tpe: __Type, extension :ObjectExtension): Boolean =  {
@@ -143,6 +144,16 @@ object Util {
     }
   }
 
+  def constructTypeNameThingy(field: Field, acc: Option[JsonObject]): JsonObject = {
+    val (typeNameField, recursive) = field.fields.partition(_.name.contentEquals("__typename"))
+    val thisLevel = typeNameField.headOption.map{field =>
+      JsonObject.apply(field.name -> Json.fromString(extractTypeName(field.fieldType)))
+    }.getOrElse(JsonObject.empty)
+    recursive.map { field =>
+      JsonObject(field.name -> constructTypeNameThingy(field, Option(thisLevel)).asJson)
+    }.foldLeft(thisLevel)((acc, nextt) =>acc.deepMerge(nextt))
+  }
+
   def middleGenericJsonObject[A, C](f: (Field, A) => ZIO[Any, Throwable, C])(fieldName: String)(field: Field)(json: JsonObject)(implicit decoder: Decoder[A], encoder: Encoder[C]): ZIO[Any, Throwable, JsonObject] =  {
     json.asJson.as[A] match {
       case Left(e) =>
@@ -213,11 +224,11 @@ object Util {
     }
   }
 
-  def checkObjectMatches(field: Field, extension: ObjectExtension): Boolean = {
+  def checkObjectMatches(field: Field, extension: ExtensionPosition): Boolean = {
 
     val typeName = extractTypeName(field.fieldType)
 
-    val res = typeName.contentEquals(extension.objectName) && field.fields.exists(_.name.contentEquals(extension.field.fieldName))
+    val res = typeName.contentEquals(extension.objectName) && field.fields.exists(_.name.contentEquals(extension.fieldName))
     println(s"CHECK MATCHES OBJECT $typeName = ${extension.objectName} -> $res")
     res
   }
@@ -246,7 +257,7 @@ object Util {
     }
   }
 
-  def checkIfExtensionUsed(field: Field, extension: ObjectExtension, path: List[JsonPathPart]): List[List[JsonPathPart]] = {
+  def checkIfExtensionUsed(field: Field, extension: ExtensionPosition, path: List[JsonPathPart]): List[List[JsonPathPart]] = {
     println(s"CHECK EXTENSION USED: $extension ${field.fieldType.kind}. ${field.fieldType.name}")
     field.fieldType.kind match {
       case __TypeKind.SCALAR => Nil
@@ -294,7 +305,7 @@ object Util {
 
   }
 
-  def createExtensionModifications(isEntityResolverQuery: Boolean, field: Field, extensions: Map[ObjectExtension, JsonObject => ZIO[Any,Throwable,JsonObject]]): List[Json => ZIO[Any, Throwable,Json]] = {
+  def createExtensionModifications(isEntityResolverQuery: Boolean, field: Field, extensions: Map[ExtensionPosition, JsonObject => ZIO[Any,Throwable,JsonObject]]): List[Json => ZIO[Any, Throwable,Json]] = {
     extensions.flatMap { case (extension, transformer) =>
       checkIfExtensionUsed(field, extension, Nil).map(path => path -> transformer)
     }.map { case (path, transformer) =>
@@ -378,6 +389,17 @@ object Util {
       extensions.mapValues(f => f(field)).toMap
     )
 
+
+    val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {case (path, tpe) => path.tail -> tpe}
+    val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
+
+    val stuff =
+      s"""|DEBUGGING
+          |${printQuery(field)}
+          |$cooridnatesDebug""".stripMargin
+    println(stuff)
+    val typeNameInsertions = constructTypenameInserters(coordinatesForTypenameQueries)
+
     // Prepare the statement
     // Execute the query
     // Extract the result
@@ -398,13 +420,15 @@ object Util {
         .flatMap(json => extensionModifications.foldLeft(ZIO(json)){ (acc, next) =>
           acc.flatMap(next(_))
         })
+        // Insert the missing typenames
+        .map(json => typeNameInsertions.foldLeft(json)((acc, next) => next(acc)))
         .flatMap(json =>ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(json)))
         .map(responseValue => PureStep(responseValue))
 
     QueryStep(ZQuery.fromEffect(completedRequest))
   }
 
-  def genericQueryHandler[R](tables: List[Table], extensions: Map[ObjectExtension, Field => JsonObject => ZIO[Any, Throwable, JsonObject]], connection: Connection)(field: Field): Step[R] = {
+  def genericQueryHandler[R](tables: List[Table], extensions: Map[ExtensionPosition, Field => JsonObject => ZIO[Any, Throwable, JsonObject]], connection: Connection)(field: Field): Step[R] = {
     // We have created an intermediate that has filtered out all the fields that have @requires
     val intermediate = toIntermediate(field, tables, "root", extensions.keys.toList)
     val fieldMask: List[Json => Json] = Nil // Transformations for removing the fields that were added to satisfy extensions
@@ -419,6 +443,16 @@ object Util {
       field,
       extensions.mapValues(f => f(field)).toMap
     )
+
+    val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {case (path, tpe) => path.tail -> tpe}
+    val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
+
+    val stuff =
+      s"""|DEBUGGING
+          |${printQuery(field)}
+          |$cooridnatesDebug""".stripMargin
+    println(stuff)
+    val typeNameInsertions = constructTypenameInserters(coordinatesForTypenameQueries)
 
     // Prepare the statement
     // Execute the query
@@ -439,15 +473,72 @@ object Util {
         .flatMap(json => extensionModifications.foldLeft(ZIO(json)){ (acc, next) =>
           acc.flatMap(next(_))
         })
+        // Insert the missing typenames
+        .map(json => typeNameInsertions.foldLeft(json)((acc, next) => next(acc)))
         .flatMap(json =>ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(json)))
         .map(responseValue => PureStep(responseValue))
 
     QueryStep(ZQuery.fromEffect(completedRequest))
   }
 
+  def checkForTypenameQuery(field: Field, acc: List[JsonPathPart]): List[(List[JsonPathPart], String)] = {
+    field.fieldType.kind match {
+      case __TypeKind.SCALAR =>
+        // Not relevant
+        Nil
+      case __TypeKind.OBJECT =>
+        val (typeQuery, recursiveCases) = field.fields.partition(_.name.contentEquals("__typename"))
+        typeQuery.map(_ => (acc, extractTypeName(field.fieldType))) ++ recursiveCases.flatMap (field => checkForTypenameQuery(field, acc ++ List(ObjectPath(field.name))))
+      case __TypeKind.INTERFACE => Nil
+      case __TypeKind.UNION => Nil
+      case __TypeKind.ENUM =>
+        // Not relevant
+        Nil
+      case __TypeKind.INPUT_OBJECT =>
+        // Cant happen
+        Nil
+      case __TypeKind.LIST =>
+        val (typeQuery, recursiveCases) = field.fields.partition(_.name.contentEquals("__typename"))
+        typeQuery.map(_ => (acc, extractTypeName(field.fieldType))) ++ recursiveCases.flatMap(field => checkForTypenameQuery(field, acc ++ List(ArrayPath, ObjectPath(field.name))))
+      case __TypeKind.NON_NULL =>
+        val isArrayIncluded = includesArray(field.fieldType)
+
+        val (typeQuery, recursiveCases) = field.fields.partition(_.name.contentEquals("__typename"))
+        typeQuery.map(_ => (acc, extractTypeName(field.fieldType))) ++ recursiveCases.flatMap { field =>
+          checkForTypenameQuery(field, if(isArrayIncluded) acc ++ List(ArrayPath, ObjectPath(field.name)) else acc ++ List(ObjectPath(field.name)))
+        }
+    }
+  }
+
+  def constructTypenameInserters(coordinates: List[(List[JsonPathPart], String)]): List[Json => Json] = {
+    coordinates.map{ case (path, tpeName) =>
+      path.foldLeft[PathWrapper](ObejctPathWrapper(root)) { (acc, next) =>
+        next match {
+          case ArrayPath => acc match {
+            case ObejctPathWrapper(path) => ArrayPathWrapper(path.each)
+            case ArrayPathWrapper(path) => ArrayPathWrapper(path.each)
+          }
+          case ObjectPath(fieldName) => acc match {
+            case ObejctPathWrapper(path) => ObejctPathWrapper(path.selectDynamic(fieldName))
+            case ArrayPathWrapper(path) => ArrayPathWrapper(path.selectDynamic(fieldName))
+          }
+        }
+      } match {
+        case ObejctPathWrapper(path) => path.obj.modify(obj => obj.add("__typename", Json.fromString(tpeName)))
+        case ArrayPathWrapper(path) =>path.obj.modify(obj => obj.add("__typename", Json.fromString(tpeName)))
+      }
+    }
+  }
+
+
+  def printQuery(field: Field, indent: String = ""): String = {
+    s"""|$indent${field.name}
+       |${field.fields.map(printQuery(_, s"$indent  ")).mkString("\n")}""".stripMargin
+  }
 
   def genericEntityHandler[R](extensions: ExtensionLogicMap, tables: List[Table], conditionsHandlers: Map[String,ObjectValue => String], connection: Connection)(value: InputValue): ZQuery[R, CalibanError, Step[R]] = {
     ZQuery.succeed(Step.MetadataFunctionStep(field => {
+
       // Convert to intermediate Representation
       val intermediate = toIntermediateFromReprQuery(field, tables, "_entities", extensions.keys.toList)
       // Extract the keys from the arguments
@@ -471,30 +562,39 @@ object Util {
       // Apply all the modifications from our extensions
       // Parse to ResponseValue and return
 
+      // Caliban federation is weird
+      val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {case (path, tpe) => path.tail -> tpe}
+      val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
+
+      val stuff =
+        s"""|DEBUGGING
+           |${printQuery(field)}
+           |$cooridnatesDebug""".stripMargin
+      println(stuff)
+      val typeNameInsertions = constructTypenameInserters(coordinatesForTypenameQueries)
+
       val completedRequest =
         ZIO(connection.prepareStatement(query))
           .flatMap(prepared => ZIO(prepared.executeQuery()))
           .flatMap(rs => ZIO{
-            println("GOT RESPONSE")
             rs.next()
             rs.getString("root")
           })
-          .tap(v => ZIO(println(s"RESPONSE from database: $v")))
           .flatMap(resultString => ZIO.fromEither(io.circe.parser.parse(resultString)))
           // TODO: Run this step in parallel
           .flatMap(json => extensionModifications.foldLeft(ZIO(json)){ (acc, next) => {
-            println("DOING SOMETHING")
             acc.flatMap(next(_))
+          }})
+          // Insert the missing typenames
+          .map(json => typeNameInsertions.foldLeft(json)((acc, next) => next(acc)))
+          .flatMap { json =>
+            ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(json))
           }
-          })
           .tapError(v => ZIO(v.printStackTrace()))
-          .flatMap(json =>ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(json)))
           .map(responseValue => {
-            println("GOT A RESPONSE VALUE")
+            println(s"GOT A RESPONSE VALUE: ${responseValue.toString}")
             PureStep(responseValue)
           })
-
-      println(completedRequest.debug)
 
       QueryStep(ZQuery.fromEffect(completedRequest))
     }))
@@ -502,7 +602,7 @@ object Util {
 
 
   def constructQueryOperation[R, S](connection: Connection, extensions: ExtensionLogicMap, tables: List[Table])(implicit schema: Schema[R,S]): Operation[R] = {
-    val tpe = extendType(schema.toType_(), extensions.keys.toList)
+    val tpe = schema.toType_()
 
     val queryFields = tpe
       .fields(__DeprecatedArgs(Some(true)))
@@ -524,7 +624,7 @@ object Util {
                                         mutationToInsertReader: Map[String, Json => String],
                                         mutationToUpdateReader: Map[String, Json => String],
                                         mutationToDeleteReader: Map[String, Json => String])(implicit schema: Schema[R,S]): Operation[R] = {
-    val tpe = extendType(schema.toType_(), extensions.keys.toList)
+    val tpe = schema.toType_()
 
     val queryFields = tpe
       .fields(__DeprecatedArgs(Some(true)))

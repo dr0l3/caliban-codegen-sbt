@@ -1,7 +1,7 @@
 import sbt.AutoPlugin
 import sbt._
 import Keys._
-import codegen.PostgresSniffer.{connToTables, docToObjectExtension, parseDocument, parseExtensions, tablesToTableAPI, to2CalibanBoilerPlate}
+import codegen.PostgresSniffer.{connToTables, docToFederatedInstances, docToObjectExtension, parseDocument, parseExtensions, tablesToTableAPI, to2CalibanBoilerPlate}
 
 import java.sql.DriverManager
 import codegen._
@@ -18,7 +18,20 @@ object PgCalibanPlugin extends AutoPlugin {
   import autoImport._
 
   override lazy val projectSettings = Seq(
-    pgCalibanExtensionFileLocation := file("src/main/resources/extensions.graphql"),
+    libraryDependencies ++= {
+      CrossVersion.partialVersion(scalaVersion.value) match {
+        case Some((2, n)) if n == 12 => List(
+          "com.github.ghostdogpr" %% "caliban" % "1.1.1+59-f6079748+20211017-1605-SNAPSHOT",
+//          "com.github.ghostdogpr" %% "caliban-federation" % "1.1.1+59-f6079748+20211017-1605-SNAPSHOT",
+        )
+        case Some((2, n)) if n == 13 => List(
+          "com.github.ghostdogpr" %% "caliban" % "1.1.1+59-f6079748+20211017-1606-SNAPSHOT",
+//          "com.github.ghostdogpr" %% "caliban-federation" % "1.1.1+59-f6079748+20211017-1606-SNAPSHOT",
+        )
+        case _ => Nil
+      }
+    },
+    pgCalibanExtensionFileLocation := file("./src/main/resources/extensions.graphql"),
     pgCalibanPostgresConnectionUrl := "jdbc:postgresql://0.0.0.0:5438/product",
     pgCalibanPostgresUser := "postgres",
     pgCalibanPostgresPassword := "postgres",
@@ -30,22 +43,27 @@ object PgCalibanPlugin extends AutoPlugin {
 
       val tables = connToTables(conn)
 
-      val extensions = if(pgCalibanExtensionFileLocation.value.exists()) {
+      println(pgCalibanExtensionFileLocation.value.toURI)
+      println(pgCalibanExtensionFileLocation.value.exists())
+      val (extensions, federatedInstances) = if(pgCalibanExtensionFileLocation.value.exists()) {
         val omg = new File(pgCalibanExtensionFileLocation.value.toURI)
 
         println("PAST OMG")
 
         val extensionDoc = parseDocument(parseExtensions(omg))
         println("PARSED STUFF")
-        docToObjectExtension(extensionDoc)
+        val federatedIstances = docToFederatedInstances(extensionDoc)
+        (docToObjectExtension(extensionDoc), federatedIstances)
       } else {
-        Nil
+        (Nil, Nil)
       }
 
+      extensions.foreach(println)
+      federatedInstances.foreach(println)
 
       println("MTH")
 
-      val outputDir = (sourceManaged in Compile).value / "generated"
+      val outputDir = (Compile / sourceManaged).value / "generated"
       outputDir.mkdirs()
 
       println("CREATED DIR")
@@ -56,7 +74,7 @@ object PgCalibanPlugin extends AutoPlugin {
 
       println("ABOUT TO WRI")
 
-      val generatedBoilerPlate = to2CalibanBoilerPlate(tablesToTableAPI(tables), extensions, tables)
+      val generatedBoilerPlate = to2CalibanBoilerPlate(tablesToTableAPI(tables, extensions), extensions, tables, federatedInstances)
 
       IO.write(outputFile,  "package generated" ++ generatedBoilerPlate)
 

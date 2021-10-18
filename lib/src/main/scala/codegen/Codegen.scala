@@ -1,20 +1,22 @@
 package codegen
 
-import caliban.ResponseValue.RawValue
+import caliban.parsing.adt.Definition.{TypeSystemDefinition, TypeSystemExtension}
+import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition
+import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition.ObjectTypeDefinition
+import caliban.parsing.adt.Definition.TypeSystemExtension.TypeExtension
+import caliban.parsing.adt.{Definition, Directive, Document, Type}
 import caliban._
 import caliban.execution.{Field => CField}
 import caliban.federation.{EntityResolver, federate}
 import caliban.introspection.adt.{__DeprecatedArgs, __Directive, __Field, __Type, __TypeKind}
-import caliban.parsing.adt.Definition.TypeSystemDefinition
-import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition
-import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition.ObjectTypeDefinition
-import caliban.parsing.adt.{Definition, Directive, Type}
-import caliban.parsing.parsers.Parsers.document
-import caliban.parsing.{ParsedDocument, SourceMapper}
+import caliban.parsing.{ParsedDocument, Parser, SourceMapper}
 import caliban.schema.Step.{MetadataFunctionStep, ObjectStep, PureStep}
 import caliban.schema.{Operation, RootSchemaBuilder, Schema, Step, Types}
 import caliban.wrappers.Wrapper
 import cats.Applicative
+import codegen.PostgresSniffer.typeMap
+import codegen.Util.{extractTypeName, typeToScalaType, typeTo__Type}
+import generic.Util.ExtensionPosition
 //import codegen.Runner.api
 import fastparse.parse
 import io.circe.optics.JsonPath.root
@@ -35,8 +37,10 @@ case object ArrayPath extends JsonPathPart
 case class ObjectPath(fieldName: String) extends JsonPathPart
 
 
-case class ObjectExtensionField(fieldName: String, fieldType: Type, requiredFields: List[String])
+case class ObjectExtensionField(fieldName: String, fieldType: ScalaType, requiredFields: List[String], isExternal: Boolean = false)
 case class ObjectExtension(objectName: String, field: ObjectExtensionField)
+case class ExternalField(name: String, tpe: Type, external: Boolean)
+case class ExternalEntity(name: String, fields: List[ExternalField], keys: List[String])
 
 
 // Wrapper neccesary for fold the fold left to work
@@ -114,6 +118,8 @@ sealed trait ScalaType {
   def name: String
 
   def isQuoted: Boolean
+
+  def to__Type: __Type
 }
 
 sealed trait BaseType extends ScalaType
@@ -124,6 +130,8 @@ case object UUIDType extends BaseType {
   override def name: String = "UUID"
 
   override def isQuoted: Boolean = true
+
+  override def to__Type: __Type = Types.makeScalar("ID",None)
 }
 
 case object IntegerType extends BaseType {
@@ -132,6 +140,8 @@ case object IntegerType extends BaseType {
   override def name: String = "Int"
 
   override def isQuoted: Boolean = false
+
+  override def to__Type: __Type = Types.int
 }
 
 case object StringType extends BaseType {
@@ -140,6 +150,8 @@ case object StringType extends BaseType {
   override def name: String = render
 
   override def isQuoted: Boolean = true
+
+  override def to__Type: __Type = Types.string
 }
 
 case object ZonedDateTimeType extends BaseType {
@@ -148,6 +160,8 @@ case object ZonedDateTimeType extends BaseType {
   override def name: String = render
 
   override def isQuoted: Boolean = true
+
+  override def to__Type: __Type = Types.makeScalar("ZonedDateTime")
 }
 
 sealed trait ContainerType extends ScalaType
@@ -158,6 +172,8 @@ case class ListType(elementType: ScalaType) extends ContainerType {
   override def name: String = render
 
   override def isQuoted: Boolean = false
+
+  override def to__Type: __Type = Types.makeList(elementType.to__Type)
 }
 
 case class OptionType(elementType: ScalaType) extends ContainerType {
@@ -166,6 +182,8 @@ case class OptionType(elementType: ScalaType) extends ContainerType {
   override def name: String = render
 
   override def isQuoted: Boolean = elementType.isQuoted
+
+  override def to__Type: __Type = elementType.to__Type
 }
 
 sealed trait FieldType {
@@ -186,9 +204,9 @@ case class Reference(scalaType: () => ScalaType) extends FieldType {
   override def strict(): ScalaType = scalaType()
 }
 
-case class Field(name: String, scalaType: FieldType, isPrimaryKey: Boolean, isExtension: Boolean, requires: List[String], isRelationship: Boolean)
+case class Field(name: String, scalaType: FieldType, isPrimaryKey: Boolean, isExtension: Boolean, requires: List[String], isRelationship: Boolean, isExternal: Boolean = false)
 
-case class CaseClassType(name: String, fields: List[Field], isBaseTableClass: Boolean = false,  isInsertForTable: Option[String] = None, isUpdateForTable: Option[String] = None, isDeleteForTable: Option[String] = None, isFederationArg: Option[String] = None) extends ScalaType {
+case class CaseClassType(name: String, fields: List[Field], isBaseTableClass: Boolean = false,  isInsertForTable: Option[String] = None, isUpdateForTable: Option[String] = None, isDeleteForTable: Option[String] = None, isFederationArg: Option[String] = None, externalKeys: Option[String] = None) extends ScalaType {
   def render = {
     val fieldRendering = fields.map { field =>
       val typeRendering = field.scalaType match {
@@ -281,7 +299,9 @@ case class CaseClassType(name: String, fields: List[Field], isBaseTableClass: Bo
 
     val federationKeys = fields.filter(_.isPrimaryKey).map(_.name)
 
-    val federationKeyDirective = if(federationKeys.nonEmpty && isFederationArg.isEmpty) s"""@GQLDirective(Key("${federationKeys.mkString(" ")}")) """ else ""
+    val isInput = (isInsertForTable.toList ++ isUpdateForTable.toList ++ isDeleteForTable.toList).nonEmpty
+
+    val federationKeyDirective = if(federationKeys.nonEmpty && isFederationArg.isEmpty && !isInput) s"""@GQLDirective(Key("${federationKeys.mkString(" ")}")) """ else ""
 
     s"""$federationKeyDirective$caseClassDefinition$extendsClauses$implementation""".stripMargin
   }
@@ -313,6 +333,16 @@ case class CaseClassType(name: String, fields: List[Field], isBaseTableClass: Bo
   }
 
   override def isQuoted: Boolean = false
+
+  override def to__Type: __Type = {
+    val f = fields.map { field =>
+      val directives = if(field.isExternal) List(federation.External) else List()
+      __Field(field.name, None, Nil, () => field.scalaType.strict().to__Type, false, None, Option(directives))
+    }
+
+    val directives = externalKeys.map(keys => List(federation.External, federation.Key(keys))).getOrElse(Nil)
+    Types.makeObject(Option(name), None, f, directives,None)
+  }
 }
 
 
@@ -333,6 +363,9 @@ case class TableAPI(
                    )
 
 object Util {
+
+
+
   def typeTo__Type(tpe: Type): __Type = {
     tpe match {
       case Type.NamedType(name, nonNull) =>
@@ -343,14 +376,34 @@ object Util {
           case "Long" => Types.long
           case "Float" => Types.float
           case "Double" => Types.double
+          case str => typeMap(str).to__Type
         }
         if(nonNull) Types.makeNonNull(inner) else inner
       case Type.ListType(ofType, nonNull) => Types.makeList(typeTo__Type(ofType))
     }
   }
 
+  def typeToScalaType(tpe: Type, alreadyWrapped: Boolean = false, external: Boolean): ScalaType = {
+    tpe match {
+      case Type.NamedType(name, nonNull) =>
+        val base = name match {
+          case "String" => StringType
+          case "Int" => IntegerType
+          case "ID" => if(external) StringType else UUIDType
+          case other => typeMap(other)
+        }
+        if(!alreadyWrapped && !nonNull) {
+          OptionType(base)
+        } else {
+          base
+        }
+
+      case Type.ListType(ofType, nonNull) => ListType(typeToScalaType(ofType, alreadyWrapped = true, external = external))
+    }
+  }
+
   def objectExtensionFieldToField(extension: ObjectExtensionField): __Field = {
-    __Field(extension.fieldName, None, Nil, () => typeTo__Type(extension.fieldType), false, None, Option(List(Directive("customextension"))))
+    __Field(extension.fieldName, None, Nil, () => extension.fieldType.to__Type, false, None, None)
   }
 
   def checkExtensionApplies(tpe: __Type, extension :ObjectExtension): Boolean =  {
@@ -524,15 +577,17 @@ object Util {
   }
 
   // Generic, straight copy
-  def toIntermediateFromReprQuery(field: CField, tables: List[Table], layerName: String, extensions: List[ObjectExtension]): Intermediate = {
+  def toIntermediateFromReprQuery(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition]): Intermediate = {
+    println(s"toIntermediateFromReprQuery: ${field.name}")
     // Top level entity query
     if(field.name.contentEquals("_entities")) {
       val tableName = field.fields.headOption.flatMap(_.parentType).flatMap(_.name).getOrElse(throw new RuntimeException("Unable to find table name for _entities request"))
       val table = tables.find(_.name.contentEquals(tableName.mkString(""))).getOrElse(throw new RuntimeException(s"Unable to find table for ${tableName.mkString("")}"))
+      val extensionColumnsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
       val (queriedCols, recurseCases) = field.fields.partition(_.fields.isEmpty) // TODO: Do dependency analysis
       // SELECT: id, name
       // FROM tablename
-      val recursiveCases = recurseCases
+      val recursiveCases = recurseCases.filterNot(field => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(field.name)))
         .map(f =>
           toIntermediate(f, tables, s"${layerName}.${f.name}", extensions)
         )
@@ -553,10 +608,11 @@ object Util {
       println(s"COLS: ${queriedCols.map(_.name)}")
       println(s"COL AND DIRS: ${queriedCols.map(col => col.name -> col.directives.map(_.name))}")
 
-      val extensionColumnsForThisTable = extensions.filter(_.objectName.contains(table.name))
+
+
 
       Intermediate(
-        queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.field.fieldName).exists(_.contentEquals(col.name))).map(_.name),
+        queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name),
         IntermediateFrom(table.name, recursiveCases),
         field
           .copy(fieldType = field.fieldType.copy(kind = __TypeKind.OBJECT)) // TODO: Annoying hack needed to "cast" the output to an object due to calibans weird handling of entityresolvers
@@ -566,17 +622,19 @@ object Util {
     }
   }
 
-  def toIntermediate(field: CField, tables: List[Table], layerName: String, extensions: List[ObjectExtension]): Intermediate = {
-    println(tables)
+  def toIntermediate(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition]): Intermediate = {
+    println(s"toIntermediate: ${field.name}")
     val tableName = field.fieldType.ofType match {
       case Some(value) => compileOfType(value)
       case None => List(field.fieldType.name.getOrElse(throw new RuntimeException(s"No typename for field ${field}")))
     }
+
     val table = tables.find(_.name.contentEquals(tableName.mkString(""))).getOrElse(throw new RuntimeException(s"Unable to find table for ${tableName.mkString("")}"))
-    val (queriedCols, recurseCases) = field.fields.partition(_.fields.isEmpty) // TODO: Do dependency analysis
+    val extensionColumnsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
+    val (queriedCols, recurseCases) = field.fields.filterNot(_.name.contentEquals("__typename")).partition(_.fields.isEmpty) // TODO: Do dependency analysis
     // SELECT: id, name
     // FROM tablename
-    val recursiveCases = recurseCases
+    val recursiveCases = recurseCases.filterNot(field => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(field.name)))
       .map(f =>
         toIntermediate(f, tables, s"${layerName}.${f.name}", extensions)
       )
@@ -597,9 +655,9 @@ object Util {
     println(s"COLS: ${queriedCols.map(_.name)}")
     println(s"COL AND DIRS: ${queriedCols.map(col => col.name -> col.directives.map(_.name))}")
 
-    val extensionColumnsForThisTable = extensions.filter(_.objectName.contains(table.name))
 
-    Intermediate(queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.field.fieldName).exists(_.contentEquals(col.name))).map(_.name), IntermediateFrom(table.name, recursiveCases), field)
+
+    Intermediate(queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name), IntermediateFrom(table.name, recursiveCases), field)
   }
 
   def compileFrom(intermediate: Intermediate, top: Boolean): String = {
@@ -909,9 +967,12 @@ object PostgresSniffer {
   }
 
 
-  def toCaseClassType(table: Table)(tables: List[Table]): CaseClassType = {
+  def toCaseClassType(table: Table, extensions: List[ObjectExtension])(tables: List[Table]): CaseClassType = {
     val primaryKeyFields = table.primaryKeys.map(col => Field(col.name, Concrete(toScalaType(col)), isPrimaryKey = true, isExtension = false, Nil, false))
     val otherColFields = table.otherColumns.map(col => Field(col.name, Concrete(toScalaType(col)), isPrimaryKey = false, isExtension = false, Nil, false))
+    val applicableExtensions = extensions.filter(_.objectName.contentEquals(table.name)).map { objectExtension =>
+      Field(objectExtension.field.fieldName, Concrete(objectExtension.field.fieldType), isPrimaryKey = false, isExtension = true, objectExtension.field.requiredFields, isRelationship = false, isExternal = objectExtension.field.isExternal)
+    }
     val relationshipFields = table.relationships.map { link =>
 
       if (link.pkTableName == table.name) {
@@ -935,7 +996,7 @@ object PostgresSniffer {
           () => ListType(typeMap(otherTableName))
         }
         val fieldName = if ((primaryKeyFields ++ otherColFields).exists(_.name == otherTableName)) s"${otherTableName}_ref" else otherTableName
-        Field(fieldName, Reference(linkType), false, false, Nil, true)
+        Field(fieldName, Reference(linkType), isPrimaryKey = false, isExtension = false, Nil, isRelationship = true)
       } else {
         // This table is foreign key, we are linking to some other table
 
@@ -962,12 +1023,12 @@ object PostgresSniffer {
           case (false, true) => () => typeMap(otherTableName)
         }
         val fieldName = if ((primaryKeyFields ++ otherColFields).exists(_.name == otherTableName)) s"${otherTableName}_ref" else otherTableName
-        Field(fieldName, Reference(linkType), false, false, Nil, false)
+        Field(fieldName, Reference(linkType), isPrimaryKey = false, isExtension = false, Nil, isRelationship = true)
       }
 
 
     }
-    val result = CaseClassType(table.name, primaryKeyFields ++ otherColFields ++ relationshipFields, isBaseTableClass = true)
+    val result = CaseClassType(table.name, primaryKeyFields ++ otherColFields ++ relationshipFields ++ applicableExtensions, isBaseTableClass = true)
     typeMap.put(table.name, result)
     result
   }
@@ -976,12 +1037,12 @@ object PostgresSniffer {
 
   // TODO: Need to fix this excessive wrapping
   def caseClassToInsertOp(caseClass: CaseClassType): FunctionType = {
-    val input = CaseClassType(s"Create${caseClass.name}Input", caseClass.fields, isInsertForTable =Option(caseClass.name))
+    val input = CaseClassType(s"Create${caseClass.name}Input", caseClass.fields.filterNot(_.isExtension).filterNot(_.isRelationship).filterNot(_.isExternal), isInsertForTable =Option(caseClass.name))
     FunctionType(s"insert_${caseClass.name}", List(FunctionArg("objectO", input)), caseClass) // TODO: Fix Object name
   }
 
   def caseClassToInsertManyOp(caseClass: CaseClassType): FunctionType = {
-    val input = CaseClassType(s"Create${caseClass.name}Input", caseClass.fields, isInsertForTable = Option(caseClass.name))
+    val input = CaseClassType(s"Create${caseClass.name}Input", caseClass.fields.filterNot(_.isExtension).filterNot(_.isRelationship).filterNot(_.isExternal), isInsertForTable = Option(caseClass.name))
     FunctionType(s"insert_many_${caseClass.name}", List(FunctionArg("object", ListType(input))), ListType(caseClass))
   }
 
@@ -1045,7 +1106,7 @@ object PostgresSniffer {
 
   def caseClassToUpdateOp(caseClass: CaseClassType): FunctionType = {
     val pkSelectorCaseClass = CaseClassType(s"${caseClass.name}PK", caseClass.fields.filter(_.isPrimaryKey), isUpdateForTable = Option(caseClass.name))
-    val valueCaseClass = CaseClassType(s"Set${caseClass.name}Fields", caseClass.fields.filterNot(_.isPrimaryKey))
+    val valueCaseClass = CaseClassType(s"Set${caseClass.name}Fields", caseClass.fields.filterNot(_.isPrimaryKey).filterNot(_.isExtension))
     val wrapperClassFields = List(
       Field("pk", Concrete(pkSelectorCaseClass), false, false, Nil, false),
       Field("set", Concrete(valueCaseClass), false, false, Nil, false)
@@ -1134,7 +1195,7 @@ object PostgresSniffer {
     }
   }
 
-  def to2CalibanBoilerPlate(apis: List[TableAPI], extensions: List[ObjectExtension], tables: List[Table]): String = {
+  def to2CalibanBoilerPlate(apis: List[TableAPI], extensions: List[ObjectExtension], tables: List[Table], externalEntities: List[ExternalEntity]): String = {
     val imports =
       """
         |import caliban._
@@ -1171,6 +1232,16 @@ object PostgresSniffer {
 
     val models = apis.map(api => api.caseClass.render2()).mkString("\n")
 
+    // External Entities
+
+    val federatedEntities = externalEntities.map { externalEntity =>
+      val fields = externalEntity.fields.map { field =>
+        val annotations = if(field.external) s"@GQLDirective(External)" else ""
+        s"$annotations ${field.name}: ${federatedGraphqlTypeToScalaType(field.tpe).name}"
+      }
+      s"""@GQLDirective(Extend) @GQLDirective(Key(${externalEntity.keys.mkString(" ")}))case class ${externalEntity.name}(${fields.mkString(",")})"""
+    }
+
     // Extension Args
 
     val extensionArgs = extensions.map { extension =>
@@ -1179,7 +1250,7 @@ object PostgresSniffer {
         apis
           .find(_.caseClass.name.contentEquals(extension.objectName)).getOrElse(throw new RuntimeException(s"Unable to find tableAPI for extension ${extensions}"))
           .caseClass.fields.filter(tableField => extension.field.requiredFields.exists(_.contentEquals(tableField.name)))
-      CaseClassType(caseClassName, requiredFields).render2()
+      CaseClassType(caseClassName, requiredFields.map(_.copy(isPrimaryKey = false))).render2()
     }.mkString("\n")
 
     // Federation args
@@ -1210,7 +1281,11 @@ object PostgresSniffer {
     println("ADDITIONAL")
     additional.foreach(println)
     println("ADDITIONAL")
-    val args = (opArgs ++ additional).groupBy(_.name).flatMap(_._2.headOption).filterNot(arg => apis.map(_.caseClass).contains(arg))
+    val args = (opArgs ++ additional)
+      .groupBy(_.name)
+      .flatMap(_._2.headOption)
+      .filterNot(arg => apis.map(_.caseClass).contains(arg))
+      .filterNot(c => externalEntities.exists(_.name.contentEquals(c.name)))
 
 
     val argCode = args.map {
@@ -1255,7 +1330,7 @@ object PostgresSniffer {
     val extensionMethods = extensions.map { extension =>
       val methodName = s"${extension.objectName}${extension.field.fieldName}"
       val otherArgs = s"${extension.objectName}${extension.field.fieldName}ExtensionArgs"
-      val returnType = graphqlTypeToScalaType(extension.field.fieldType).name
+      val returnType = extension.field.fieldType.name
       s"def $methodName(field: Field, args: $otherArgs): ZIO[Any,Throwable, $returnType]"
     }
     val extensionTrait =
@@ -1268,7 +1343,7 @@ object PostgresSniffer {
       val implicitParams = s"schema: Schema[Any,${api.caseClass.name}]"
       s"""def create${api.caseClass.name}EntityResolver($params)(implicit $implicitParams): EntityResolver[Any] = new EntityResolver[Any] {
          |    override def resolve(value: InputValue): ZQuery[Any, CalibanError, Step[Any]] = genericEntityHandler(extensions, tables, conditionsHandlerMap, connection)(value)
-         |    override def toType: __Type = extendType(schema.toType_(), extensions.keys.toList)
+         |    override def toType: __Type = schema.toType_()
          |}""".stripMargin
     }
 
@@ -1282,7 +1357,7 @@ object PostgresSniffer {
     val extensionLogicEntries = extensions.map { extension =>
       val extensionInputType = s"${extension.objectName}${extension.field.fieldName}ExtensionArgs"
       val extensionMethodName = s"${extension.objectName}${extension.field.fieldName}"
-      s"""ObjectExtension("${extension.objectName}", ObjectExtensionField("${extension.field.fieldName}", Type.NamedType("${extension.field.fieldType.toString().replaceAllLiterally("!", "")}", nonNull = ${extension.field.fieldType.nonNull}), Nil)) -> middleGenericJsonObject[$extensionInputType,${graphqlTypeToScalaType(extension.field.fieldType).name}](extensions.${extensionMethodName})("${extension.field.fieldName}")"""
+      s"""ExtensionPosition("${extension.objectName}","${extension.field.fieldName}") -> middleGenericJsonObject[$extensionInputType,${extension.field.fieldType.name}](extensions.${extensionMethodName})("${extension.field.fieldName}")"""
     }
 
     val insertByFieldNameEntries = apis.flatMap(_.insert).map { insertOp =>
@@ -1363,10 +1438,12 @@ object PostgresSniffer {
          |}
          |""".stripMargin
 
-    s"""|
+    s"""
        |$imports
        |
        |$models
+       |
+       |${federatedEntities.mkString("\n")}
        |
        |$extensionArgs
        |
@@ -1388,148 +1465,25 @@ object PostgresSniffer {
        |""".stripMargin
   }
 
-  def toCalibanBoilerPlate(apis: List[TableAPI], extensions: List[ObjectExtension]) = {
-    val allOps = apis.flatMap(api => api.delete.toList ++ api.insert.toList ++ api.update.toList ++ api.getById.toList)
-    val readOps = apis.flatMap(api => api.getById.toList)
-    val writeOps = apis.flatMap(api => api.delete.toList ++ api.insert.toList ++ api.update.toList)
-
-    // Model
-
-    val models = apis.map(api => api.caseClass.renderWithFederation()).mkString("\n")
-
-    // Args
-    val opArgs = apis.flatMap(api => (api.delete.toList.flatMap(_.args) ++ api.insert.toList.flatMap(_.args) ++ api.update.toList.flatMap(_.args) ++ api.getById.toList.flatMap(_.args)).map(_.tpe).distinct)
-    val additional = opArgs.flatMap(v => extractAllCompositeTypes(v))
-    println("ADDITIONAL")
-    additional.foreach(println)
-    println("ADDITIONAL")
-    val args = (opArgs ++ additional).distinct.filterNot(arg => apis.map(_.caseClass).contains(arg))
-
-
-    val argCode = args.map {
-      case baseType: BaseType => baseType.render
-      case containerType: ContainerType => containerType.render
-      case c : CaseClassType => c.copy(fields = c.fields.filterNot(_.isRelationship)).render
+  def extractNameWithWrapper(tpe: __Type, wrapper: Option[String]): String = {
+    tpe.kind match {
+      case __TypeKind.SCALAR =>
+        val base = tpe.name.get match {
+          case "String" => "String"
+          case "Integer" => "Int"
+          case "ID" => "UUID"
+        }
+        wrapper.map(wrap => s"$wrap[$base]").getOrElse(base)
+      case __TypeKind.OBJECT =>
+        val base = extractTypeName(tpe)
+        wrapper.map(wrap => s"$wrap[$base]").getOrElse(base)
+      case __TypeKind.INTERFACE => ???
+      case __TypeKind.UNION => ???
+      case __TypeKind.ENUM => ???
+      case __TypeKind.INPUT_OBJECT => ???
+      case __TypeKind.LIST => extractNameWithWrapper(tpe.ofType.get, Option("List"))
+      case __TypeKind.NON_NULL => extractNameWithWrapper(tpe.ofType.get, None)
     }
-
-    // QueryRoot
-    // TODO: Do something about tables with no
-    val renderedQueryOps = readOps.map { functionType =>
-      val renderedReturnType = functionType.returnType.name
-
-      if (functionType.args.isEmpty) s"${functionType.name}: ${renderedReturnType}"
-      else {
-        val renderedArgs = functionType.args.map(_.tpe.name)
-        s"${functionType.name}: (Field) =>  ${renderedArgs.mkString("(", ",", ")")} => ${renderedReturnType}"
-      }
-    }
-    val queryRoot =
-      s"""case class Queries (
-         |${renderedQueryOps.map(str => s"\t$str").mkString(", \n")}
-         |)""".stripMargin
-
-    val renderedMutationOps = writeOps.map { functionType =>
-      val renderedReturnType = functionType.returnType.name
-
-      if (functionType.args.isEmpty) s"${functionType.name}: ${renderedReturnType}"
-      else {
-        val renderedArgs = functionType.args.map(_.tpe.name)
-        s"${functionType.name}: (Field) =>  ${renderedArgs.mkString("(", ",", ")")} => ${renderedReturnType}"
-      }
-    }
-
-    val mutationRoot =
-      s"""case class Mutations(
-         |${renderedMutationOps.map(str => s"\t${str}").mkString(", \n")}
-         |)
-         |""".stripMargin
-
-    // Schema Implicits
-
-    val outputTypes = apis.map(_.caseClass) ++ allOps.map(_.returnType)
-
-    outputTypes.foreach(println)
-
-    val schemaImplicits = outputTypes.flatMap {
-      case c: CaseClassType => Some(s"implicit val ${c.name.toLowerCase()}Schema = gen[${c.name}]")
-      case _ => None
-    }
-
-    // Argbuilder Implicits
-
-    val inputTypes = allOps.flatMap(_.args.map(_.tpe)).flatMap { scalaType =>
-      scalaType match {
-        case c: CaseClassType if c.fields.nonEmpty => Some(s"implicit val ${c.name.toLowerCase}Arg = ArgBuilder.gen[${c.name}]")
-        case _ => None
-      }
-    }
-
-    val renderedServiceFunctions = allOps.map { function =>
-      val renderedFunctionArgs = List("field: codegen.Field") ++ function.args.map { arg =>
-        s"${arg.name}: ${arg.tpe.name}"
-      }
-      s"def ${function.name}(${renderedFunctionArgs.mkString(",")}): ${function.returnType.name}"
-    }
-
-
-    //TODO: FIXservice name
-    val serviceDefinition = {
-      val serviceName = s"TestService"
-
-      s"""
-         |type ZIO${serviceName} = Has[$serviceName]
-         |
-         | trait ${serviceName} {
-         |${renderedServiceFunctions.map(method => s"\t $method").mkString("\n")}
-         | }
-         |
-         |val schema = new GenericSchema[ZIO${serviceName}]{}
-         |import schema._
-         |
-         | def buildApi(query: Queries, mutation: Mutations) : GraphQL[Console with Clock with ZIO${serviceName}] =  {
-         |   val api = graphQL(
-         |     RootResolver(
-         |       query,
-         |       mutation
-         |     )
-         |   )
-         |   api
-         | }
-         |
-         |
-         |""".stripMargin
-    }
-
-    val imports =
-      """import caliban._
-        |import caliban.GraphQL.graphQL
-        |import caliban.execution.Field
-        |import caliban.schema.{ArgBuilder, GenericSchema}
-        |import caliban.schema.Schema.gen
-        |import caliban.schema.Annotations.GQLDirective
-        |import caliban.federation._
-        |import zio.Has
-        |import zio.clock.Clock
-        |import zio.console.Console
-        |
-        |import java.time.ZonedDateTime
-        |import java.util.UUID""".stripMargin
-
-    val all = {
-      List("// Models ") ++ List(models) ++
-        List("// Output types ") ++ outputTypes.filterNot(output => apis.map(_.caseClass).contains(output)).filter {
-        case c: CaseClassType => true
-        case _ => false
-      }.map(_.render) ++
-        List("// Arg code ") ++ argCode ++
-        List("// QueryRoot ") ++ List(queryRoot) ++
-        List("// MutationRoot ") ++ List(mutationRoot) ++
-        //        List("// Schema implicits ") ++ schemaImplicits ++
-        //        List("// Arg Builder implicits ") ++ inputTypes ++
-        List("// Service definition ") ++ List(serviceDefinition)
-    }
-
-    (List(imports) ++ List("object Whatever {") ++ all.distinct ++ List("}")).mkString("\n")
   }
 
   def graphqlTypeToScalaType(tpe: Type): ScalaType = {
@@ -1538,6 +1492,7 @@ object PostgresSniffer {
         case "Int" => IntegerType
         case "String" => StringType
         case "ID" => UUIDType
+        case _ => typeMap(name)
       }
       case Type.ListType(ofType, nonNull) =>ListType(graphqlTypeToScalaType(ofType))
     }
@@ -1546,374 +1501,25 @@ object PostgresSniffer {
     } else {
       inner
     }
-
   }
 
-  def toExtensionBoilerplate(tables: List[Table], tableAPIs: List[TableAPI], extensions: List[ObjectExtension]): String = {
-
-
-    val extensionMethodSignatures = extensions.map{ extension =>
-      val requiredFields =
-        tableAPIs
-          .find(_.caseClass.name.contentEquals(extension.objectName)).getOrElse(throw new RuntimeException(s"Unable to find tableAPI for extension ${extensions}"))
-          .caseClass.fields.filter(tableField => extension.field.requiredFields.exists(_.contentEquals(tableField.name)))
-      val inputTypes = requiredFields.map(_.scalaType match {
-        case Concrete(scalaType) => scalaType.name
-        case Reference(scalaType) => scalaType().name
-      }).mkString("(", ",", ")")
-
-      s"${extension.objectName}${extension.field.fieldName}Extension: $inputTypes => ZIO[Any,Nothing,${graphqlTypeToScalaType(extension.field.fieldType).name}]"
+  def federatedGraphqlTypeToScalaType(tpe: Type): ScalaType = {
+    val inner = tpe match {
+      case Type.NamedType(name, nonNull) => name match {
+        case "Int" => IntegerType
+        case "String" => StringType
+        case "ID" => StringType
+        case _ => typeMap(name)
+      }
+      case Type.ListType(ofType, nonNull) =>ListType(federatedGraphqlTypeToScalaType(ofType))
     }
-
-    val extensionMethodNames = extensions.map(extension => s"${extension.objectName}${extension.field.fieldName}Extension")
-
-    val extensionObjectHandlers = extensions.map { extension =>
-      val requiredFields =
-        tableAPIs
-          .find(_.caseClass.name.contentEquals(extension.objectName)).getOrElse(throw new RuntimeException(s"Unable to find tableAPI for extension ${extensions}"))
-          .caseClass.fields.filter(tableField => extension.field.requiredFields.exists(_.contentEquals(tableField.name)))
-
-      val params = requiredFields.map { field =>
-        s"""jsonObject.apply("${field.name}").get.as[${field.scalaType.toName()}].right.get"""
-      }
-
-
-      val jsonConverter = graphqlTypeToScalaType(extension.field.fieldType) match {
-        case baseType: BaseType => baseType match {
-          case UUIDType => "Json.fromString(output.toString())"
-          case IntegerType => "Json.fromInt(output)"
-          case StringType => "Json.fromString(output)"
-          case ZonedDateTimeType => "Json.fromString(output.format(DateTimeFormatter.ISO_DATE_TIME))"
-        }
-        case containerType: ContainerType => ""
-        case c: CaseClassType => ""
-      }
-      s"""def ${extension.objectName}${extension.field.fieldName}ExtensionConverter(jsonObject: JsonObject): ZIO[Any,Nothing,JsonObject] = {
-         |  ${extension.objectName}${extension.field.fieldName}Extension(${params.mkString(",")}).map(output => jsonObject.add("${extension.field.fieldName}", $jsonConverter))
-         |}""".stripMargin
+    if(tpe.nullable) {
+      OptionType(inner)
+    } else {
+      inner
     }
-
-    //TODO: FIX Nil
-    val extensionObjectDeclarations = extensions.map { extension =>
-      s"""ObjectExtension("${extension.objectName}", ObjectExtensionField("${extension.field.fieldName}", Type.NamedType("${extension.field.fieldType.toString()}", nonNull = ${extension.field.fieldType.nonNull}), Nil)) -> ${extension.objectName}${extension.field.fieldName}ExtensionConverter"""
-    }
-
-    val imports =
-      """
-        |import Util.{argToWhereClause, doesntReallyMatter}
-        |import caliban.ResponseValue.RawValue
-        |import caliban.{GraphQL, InputValue, Value}
-        |import caliban.introspection.adt.{__DeprecatedArgs, __Directive, __Type, __TypeKind}
-        |import caliban.parsing.adt.Type
-        |import caliban.schema.Step.{MetadataFunctionStep, ObjectStep}
-        |import caliban.schema.{Operation, PureStep, RootSchemaBuilder, Schema, Step}
-        |import generated.Whatever.Queries
-        |import io.circe.{Json, JsonObject}
-        |import zio.{UIO, ZIO}
-        |import caliban.execution.{Field => CField}
-        |import caliban.wrappers.Wrapper
-        |
-        |import io.circe.optics.JsonPath.root
-        |import io.circe.optics.{JsonPath, JsonTraversalPath}
-        |
-        |import java.sql.{Connection, DriverManager}
-        |import java.util.UUID
-        |""".stripMargin
-
-    val extensionLogicByTypeMap =
-      s"""
-         |    val extensionLogicByType: Map[ObjectExtension, JsonObject => ZIO[Any,Nothing,JsonObject]] = Map(
-         |      ${extensionObjectDeclarations.mkString(",\n")}
-         |    )
-         |""".stripMargin
-
-    val constrctOperationMethod = s"""
-      |def constructOperation[R,Q](schema: Schema[R,Q])(implicit connection: Connection): Operation[R] = {
-      |    ${extensionObjectHandlers.mkString("\n")}
-      |
-      |    $extensionLogicByTypeMap
-      |
-      |    val tpe = Util.extendType(schema.toType_(), extensionLogicByType.keys.toList)
-      |
-      |    def createFieldHandlers(a: __DeprecatedArgs): Map[String, MetadataFunctionStep[R]] = {
-      |      val rootFields = tpe.fields(a).getOrElse(Nil)
-      |
-      |      rootFields.map { rootField =>
-      |        def handler(field: CField): Step[R] = {
-      |          // TODO: Possibly do some sort of requirement analysis
-      |          // TODO: Create field mask
-      |          // TODO: Add additional required fields
-      |
-      |          // We have created an intermediate that has filtered out all the fields that have @requires
-      |          val intermediate = Util.toIntermediate(field, tables, "root", extensionLogicByType.keys.toList)
-      |          val fieldMask: List[Json => Json] = Nil // Transformations for removing the fields that were added to satisfy extensions
-      |
-      |          val condition = field.arguments.map { case (k, v) => argToWhereClause(k, v) }.mkString(" AND ")
-      |          val query = Util.toQueryWithJson(intermediate, "root", condition)
-      |          val prepared = connection.prepareStatement(query)
-      |
-      |          println(query)
-      |          val rs = prepared.executeQuery()
-      |          rs.next()
-      |          val resultJson = rs.getString("root")
-      |          println(resultJson)
-      |
-      |          val json = io.circe.parser.parse(resultJson).getOrElse(Json.Null)
-      |
-      |          val modificaitons = doesntReallyMatter(field, extensionLogicByType, false)
-      |
-      |          val modifiedJson = modificaitons.foldLeft(ZIO.succeed(json)){ (acc, next) =>
-      |            acc.flatMap(next(_))
-      |          }
-      |
-      |          PureStep(RawValue(zio.Runtime.global.unsafeRun(modifiedJson).spaces4)) // TODO: FIx
-      |        }
-      |
-      |        rootField.name -> MetadataFunctionStep(handler)
-      |      }.toMap
-      |    }
-      |
-      |    val queryFields = createFieldHandlers(__DeprecatedArgs(Option(true)))
-      |    val resolver = ObjectStep(
-      |      tpe.name.getOrElse("queries"),
-      |      queryFields
-      |    )
-      |    Operation(tpe, resolver)
-      |  }
-      |""".stripMargin
-
-    def tableToReprCondition(table: Table): String = {
-      val primaryKeyConditions = table.primaryKeys.map { column =>
-        val quoted = toScalaScalar(column.sqltype) match {
-          case UUIDType => true
-          case IntegerType => false
-          case StringType => true
-          case ZonedDateTimeType => true
-        }
-
-        if (quoted) s""""${column.name}" ++ " = '" ++ input.fields("${column.name}").toString.replaceAllLiterally(\"\\\"\", \"\") ++ "'" """
-        else s""""${column.name}" ++ " = " ++ input.fields("${column.name}").toString.replaceAllLiterally(\"\\\"\", \"\") """
-
-      }
-      s"""def ${table.name}ReprToCondition(input: ObjectValue): String = {
-         |  (${primaryKeyConditions.mkString(" AND ")})
-         |}
-         |""".stripMargin
-    }
-
-    val tpeToReprConditionMapEntries = tables.filter(_.primaryKeys.nonEmpty).map { table =>
-      s""""${table.name}" -> ${table.name}ReprToCondition"""
-    }.mkString(",\n")
-
-    val tpeToReprConditionsMap =
-      s"""
-         |val tpeToConditionHandler: Map[String, ObjectValue => String] = Map(
-         |  $tpeToReprConditionMapEntries
-         |)
-         |""".stripMargin
-
-    val insertOperations = tableAPIs.flatMap(api => api.insert.toList)
-
-    val tpeInsertReaderFunctions = insertOperations.map { op =>
-      val tpeName =op.returnType.name
-      val args = op.args.head.tpe match { // TODO: HAcky fucking shit
-        case baseType: BaseType => Nil
-        case containerType: ContainerType => Nil
-        case c: CaseClassType => c.fields.filterNot(_.isRelationship)
-      }
-      val fields = args.map(_.name)
-      val fieldExtractors = args.map { arg =>
-        val isOptional = arg.scalaType.strict() match {
-          case baseType: BaseType => false
-          case containerType: ContainerType => true
-          case c: CaseClassType => false
-        }
-        if(isOptional) {
-          s"""val ${arg.name} = input.get("${arg.name}").map(_.toString.replaceAllLiterally("\\\"", "")).getOrElse("null")"""
-        } else {
-          s"""val ${arg.name} = input("${arg.name}").toString.replaceAllLiterally("\\\"", "")"""
-        }
-      }
-      val fieldReferences = args.map { arg =>
-        val shouldBeQuoted = arg.scalaType.strict() match {
-          case baseType: BaseType => baseType match {
-            case UUIDType => true
-            case IntegerType => false
-            case StringType => true
-            case ZonedDateTimeType => true
-          }
-          case containerType: ContainerType => false
-          case c: CaseClassType => false
-        }
-        if(shouldBeQuoted) {
-          s""""'" ++ ${arg.name} ++ "'""""
-        } else {
-          s"${arg.name}"
-        }
-      }.mkString(""" ++ "," ++ """)
-      val insertDefinition = s""""insert into $tpeName(${fields.mkString(", ")}) values (" ++ ${fieldReferences} ++ ")""""
-      s"""
-         |def ${tpeName}InputReader(input: Map[String, InputValue]): String = {
-         |  ${fieldExtractors.mkString("\n")}
-         |  $insertDefinition
-         |}
-         |""".stripMargin
-    }
-
-    val tpeToInsertInputReaderEntries = insertOperations.map{ op =>
-      val tpeName = op.returnType.name
-      val inputReaderName = s"${tpeName}InputReader"
-      s""""$tpeName" -> $inputReaderName"""
-    }.mkString(",\n")
-
-    val tpeToInsertInputReaderMap =
-      s"""
-      |val tpeToInsertInputReader: Map[String, Map[String, InputValue] => String] = Map(
-      | $tpeToInsertInputReaderEntries
-      |)
-      |""".stripMargin
-
-    def toFederatedBoilerplate(tables: List[Table]) = {
-
-
-      /*
-       val ordersEntityResolver = new EntityResolver[R] {
-        override def resolve(value: InputValue): ZQuery[R, CalibanError, Step[R]] = {
-          genericHandler(value)
-        }
-
-        override def toType: __Type = orderSchema.toType_()
-      }
-       */
-      val entityResolvers = tables.filter(_.primaryKeys.nonEmpty).map { table =>
-        s""" val ${table.name}EntityResolver = new EntityResolver[R] {
-           |  override def resolve(value: InputValue): ZQuery[R, CalibanError, Step[R]] = {
-           |        genericHandler(value)
-           |      }
-           |
-           |  override def toType: __Type = Util.extendType(${table.name}Schema.toType_(), extensionLogicByType.keys.toList)
-           |}
-           |""".stripMargin
-      }
-
-      val entityResolverNames = tables.filter(_.primaryKeys.nonEmpty).map { table =>
-        s"${table.name}EntityResolver"
-      }
-
-      val entityResolverList = entityResolverNames.tail.mkString(s"val entityResolverList = List(", ",", ")")
-
-      val genericHandler = """
-                             | def genericHandler(value: InputValue): ZQuery[R, CalibanError, Step[R]] = {
-                             |      ZQuery.succeed(Step.MetadataFunctionStep(field => {
-                             |
-                             |        val intermediate = toIntermediateFromReprQuery(field, tables, "_entities", extensionLogicByType.keys.toList)
-                             |
-                             |        val otherArg = {
-                             |          value match {
-                             |            case InputValue.ListValue(values) => ""
-                             |            case o @ ObjectValue(fields) =>
-                             |              tpeToConditionHandler(fields("__typename").toInputString.replaceAllLiterally("\"", ""))(o)
-                             |            case InputValue.VariableValue(name) => ""
-                             |            case value: Value => ""
-                             |          }
-                             |        }
-                             |        val condition = otherArg
-                             |        val query = Util.toQueryWithJson(intermediate, "root", condition)
-                             |        val prepared = connection.prepareStatement(query)
-                             |
-                             |        println(query)
-                             |        val rs = prepared.executeQuery()
-                             |        rs.next()
-                             |        val resultJson = rs.getString("root")
-                             |        println(resultJson)
-                             |
-                             |        val json = io.circe.parser.parse(resultJson).getOrElse(Json.Null)
-                             |
-                             |        val modificaitons = doesntReallyMatter(field, extensionLogicByType, false)
-                             |
-                             |        val modifiedJson = modificaitons.foldLeft(ZIO.succeed(json)){ (acc, next) =>
-                             |          acc.flatMap(next(_))
-                             |        }
-                             |
-                             |        val jsonRaw = zio.Runtime.global.unsafeRun(modifiedJson).noSpaces
-                             |
-                             |
-                             |        PureStep(RawValue(jsonRaw)) // TODO: FIx
-                             |
-                             |      }))
-                             |    }
-                             |""".stripMargin
-
-      val schemaImplicits = tables.filter(_.primaryKeys.nonEmpty).map { table =>
-        s"${table.name}Schema: Schema[R, ${table.name}]"
-      }
-
-      s"""
-         |def createFederatedApi[R](
-         |    connection: Connection,
-         |    ${extensionMethodSignatures.mkString(",")}
-         |                           )(implicit querySchema: Schema[R, Queries], ${schemaImplicits.mkString(", ")}): GraphQL[R] = {
-         |    val original = createApi(Nil, connection, ${extensionMethodNames.mkString(", ")})
-         |
-         |
-         |   ${extensionObjectHandlers.mkString("\n")}
-         |
-         |   ${extensionLogicByTypeMap}
-         |
-         |   $genericHandler
-         |
-         |   ${entityResolvers.mkString("\n\n")}
-         |
-         |   $entityResolverList
-         |
-         |    federate(
-         |      original,
-         |      ${entityResolverNames.head},
-         |      entityResolverList: _*
-         |    )
-         |  }""".stripMargin
-    }
-
-    s"""
-      |$imports
-      |
-      |object ApiCreator {
-      |
-      |val tables = ${tables.map(_.renderSelf()).mkString("List(", ",", ")")}
-      |
-      |${tables.filter(_.primaryKeys.nonEmpty).map(tableToReprCondition).mkString("\n\n")}
-      |
-      |$tpeToReprConditionsMap
-      |
-      |${tpeInsertReaderFunctions.mkString("\n\n")}
-      |
-      |$tpeToInsertInputReaderMap
-      |
-      |${toFederatedBoilerplate(tables)}
-      |
-      |def createApi[R](
-      |   directives: List[__Directive] = Nil,
-      |   connection: Connection,
-      |   ${extensionMethodSignatures.mkString(",")}
-      |   )(
-      |    implicit
-      |    querySchema: Schema[R, Queries]
-      |  ): GraphQL[R] = new GraphQL[R] {
-      |
-      |    $constrctOperationMethod
-      |    override protected val schemaBuilder: RootSchemaBuilder[R] = RootSchemaBuilder(
-      |      Option(
-      |        constructOperation(querySchema)(connection)
-      |      ),
-      |      None,
-      |      None
-      |    )
-      |    override protected val wrappers: List[Wrapper[R]] = Nil
-      |    override protected val additionalDirectives: List[__Directive] = directives
-      |  }
-      |}
-      |""".stripMargin
   }
+
 
 
   def connToTables(implicit conn: Connection): List[Table] = {
@@ -1952,8 +1558,8 @@ object PostgresSniffer {
     toTables(tableInfo, columnInfo, primaryKeyInfo, exportedKeyInfo, importedKeyInfo, indexInfo)
   }
 
-  def tablesToTableAPI(tables: List[Table]): List[TableAPI] = {
-    tables.map(toCaseClassType(_)(tables)).map { tableCaseClass =>
+  def tablesToTableAPI(tables: List[Table], extensions: List[ObjectExtension]): List[TableAPI] = {
+    tables.map(toCaseClassType(_, extensions)(tables)).map { tableCaseClass =>
       if(tableCaseClass.fields.exists(_.isPrimaryKey)) {
         TableAPI(
           tableCaseClass,
@@ -1976,13 +1582,6 @@ object PostgresSniffer {
     }
   }
 
-  def tablesToBoilerplate(tables: List[Table], extensions: List[ObjectExtension]) = {
-    tables.map(toCaseClassType(_)(tables)).foreach(caseClass => println(caseClass.render))
-    //TODO: Fix no primary key
-    val apis = tablesToTableAPI(tables)
-
-    toCalibanBoilerPlate(apis, extensions)
-  }
 
 
 
@@ -2006,120 +1605,6 @@ object PostgresSniffer {
   }
 
 
-  def constructOperation[R,Q](schema: Schema[R,Q], tables: List[Table])(implicit connection: Connection): Operation[R] = {
-
-    def addressLogic(id: UUID): ZIO[Any, Nothing, String] = UIO(s"muhuhuha: ${id}")
-    def addAddress(jsonObject: JsonObject): ZIO[Any, Nothing,JsonObject] = {
-      addressLogic(jsonObject.apply("id").get.as[UUID].right.get).map(addrss => jsonObject.add("address", Json.fromString(addrss)))
-    }
-
-    val extensionLogicByType: Map[ObjectExtension, JsonObject => ZIO[Any, Nothing,JsonObject]] = Map(
-      ObjectExtension("users", ObjectExtensionField("address", Type.NamedType("String", nonNull = true),Nil)) -> addAddress
-    ) // Construct this in codegen
-
-    val tpe = Util.extendType(schema.toType_(), extensionLogicByType.keys.toList)
-
-    def createFieldHandlers(a: __DeprecatedArgs): Map[String, MetadataFunctionStep[R]] = {
-      val rootFields = tpe.fields(a).getOrElse(Nil)
-
-      rootFields.map { rootField =>
-        def handler(field: CField): Step[R] = {
-          // TODO: Possibly do some sort of requirement analysis
-          // TODO: Create field mask
-          // TODO: Add additional required fields
-
-          // We have created an intermediate that has filtered out all the fields that have @requires
-          val intermediate = Util.toIntermediate(field, tables, "root", extensionLogicByType.keys.toList)
-          val fieldMask: List[Json => Json] = Nil // Transformations for removing the fields that were added to satisfy extensions
-
-          val condition = field.arguments.map { case (k, v) => Util.argToWhereClause(k, v) }.mkString(" AND ")
-          val query = Util.toQueryWithJson(intermediate, "root", Option(condition))
-          val prepared = connection.prepareStatement(query)
-
-          println(query)
-          val rs = prepared.executeQuery()
-          rs.next()
-          val resultJson = rs.getString("root")
-          println(resultJson)
-
-          // We have now received the result from the database
-          // This result contains the queried for data - the fields from the extensions + the requirements from the extensions
-          // Now we need to extract the arguments from the resultset
-          val json = io.circe.parser.parse(resultJson).getOrElse(Json.Null)
-          // We need to generate this code
-          // So we have access some handlers here
-
-          // So essentially we need a function with the following signare
-
-          // That List[String] here is json paths
-          // Should probably be some small sealed trait like
-
-
-          val modificaitons = Util.createExtensionModifications(field, extensionLogicByType)
-
-          val modifiedJson = modificaitons.foldLeft(ZIO.succeed(json)){ (acc, next) =>
-            acc.flatMap(next(_))
-          }
-
-          // We can turn the field into a list of paths
-
-//          json.hcursor.downField("users").downArray.values.get.map(_.hcursor.downField(""))
-
-
-//          val modified = modifications.foldLeft(json)((acc, next) => next.apply(acc))
-
-          // To make this work we need to generate the above modification list for the entire schema
-          // then we can selectively apply the modification every time they are "enabled" by selecting the field
-
-
-
-          // Essentially we need a way to select the places where the arguments are placed
-          // Then for every instance of the argument we find, we need to compute extension value and splice it into the
-
-          // We have got our result for all fields not marked with @requires
-          // We need to resolve the rest
-          // BUt how do we "get" this handler?
-          // We are only able to extract the handler for the root query, but in this case we are
-          // The real problem here is that the typing information is separate from the plan information.
-          // If the plan information was present in the codegen.Field structure then it would be possible to
-          // "zoom into a part of the query" and change/wrap execution of that part
-
-          // Plan:
-          // Add the transformations to the doStuff signature
-          // I can then resolve the fields I know i can resolve in postgres
-          // And the resolve the rest using some other method
-
-//          println(modified.spaces4)
-//          println("MODIFIED STUFFUFU")
-
-
-          PureStep(RawValue(zio.Runtime.global.unsafeRun(modifiedJson).spaces4)) // TODO: FIx
-
-          //Another possibilit is something like a SubSElect[A,B] typeclass made with magnolia
-
-          // It seems that maybe the right solution is define this in codegen instead
-          // So essentially you define your extension is regular graphql with a couple of directives that are quite close to federation
-          // So an extends directive available on object
-          // And an optional requires directive available on fields
-          // Then you can create stub types and extend them with custom logic.
-          // This should generate the types and an implementation for the base types and handlers for extending the base types with the custom logic
-
-          // This makes sense because the base schema is generated at run time and not from some
-
-        }
-
-        rootField.name -> MetadataFunctionStep(handler)
-      }.toMap
-    }
-
-    val queryFields = createFieldHandlers(__DeprecatedArgs(Option(true)))
-    val resolver = ObjectStep(
-      tpe.name.getOrElse("queries"),
-      queryFields
-    )
-    Operation(tpe, resolver)
-  }
-
 
   def parseExtensions(extensionFileLocation: java.io.File): String =  {
     if(!extensionFileLocation.exists()) ""
@@ -2131,13 +1616,11 @@ object PostgresSniffer {
     }
   }
 
-  def parseDocument(query: String) = {
-    val sm = SourceMapper(query)
-    val whatj = parse(query, document(_)).get.value
-    whatj
+  def parseDocument(query: String): Document = {
+    zio.Runtime.default.unsafeRun(Parser.parseQuery(query))
   }
 
-  def objectsInDocument(doc: ParsedDocument): List[ObjectTypeDefinition] = {
+  def objectsInDocument(doc: Document): List[ObjectTypeDefinition] = {
     doc.definitions.flatMap {
       case definition: Definition.ExecutableDefinition => Nil
       case definition: TypeSystemDefinition => definition match {
@@ -2157,7 +1640,7 @@ object PostgresSniffer {
     }
   }
 
-  def docToObjectExtension(doc: ParsedDocument): List[ObjectExtension]= {
+  def docToObjectExtension(doc: Document): List[ObjectExtension]= {
     val objectDefinitions = doc.definitions.flatMap {
       case definition: Definition.ExecutableDefinition => Nil
       case definition: TypeSystemDefinition => definition match {
@@ -2166,7 +1649,10 @@ object PostgresSniffer {
         case definition: TypeDefinition => definition match {
           case TypeDefinition.ObjectTypeDefinition(description, name, implements, directives, fields) =>
             val objectExtensionsFields = fields.map { field =>
-              ObjectExtensionField(fieldName = field.name, fieldType = field.ofType, requiredFields = field.directives.filter(_.name == "requires").map(_.arguments.values.head.toInputString.replaceAllLiterally("\"", "")))
+              val requiredFields = field.directives.filter(_.name == "requires").map(_.arguments.values.head.toInputString.replaceAllLiterally("\"", ""))
+              val isExternla = field.directives.exists(_.name.contentEquals("external"))
+              val tpe = typeToScalaType(field.ofType, external = isExternla)
+              ObjectExtensionField(fieldName = field.name, fieldType = tpe, requiredFields = requiredFields, isExternla)
             }
 
             objectExtensionsFields.map { objectExtensionsField =>
@@ -2184,8 +1670,44 @@ object PostgresSniffer {
     objectDefinitions
   }
 
+  def docToFederatedInstances(doc: Document): List[ExternalEntity] = {
+    doc.definitions.flatMap {
+      case definition: Definition.ExecutableDefinition => Nil
+      case definition: TypeSystemDefinition => Nil
+      case extension: Definition.TypeSystemExtension => extension match {
+        case TypeSystemExtension.SchemaExtension(directives, query, mutation, subscription) => Nil
+        case extension: TypeSystemExtension.TypeExtension => extension match {
+          case TypeExtension.ScalarTypeExtension(name, directives) => Nil
+          case TypeExtension.ObjectTypeExtension(name, implements, directives, fields) =>
+            val externalFields = fields.map { field =>
+              ExternalField(field.name, field.ofType, field.directives.exists(_.name.contentEquals("external")))
+            }
+            val keys = directives
+              .find(_.name.contentEquals("key"))
+              .flatMap(_.arguments
+                .get("fields"))
+              .map(_.toInputString.replaceAllLiterally("\n", ""))
+              .toList
+              .flatMap(_.split(" "))
 
-  def checkExtensionValid(extensions: List[ObjectExtension], baseApi: ParsedDocument): List[String] = {
+            val caseClassFields = fields.map{field =>
+              codegen.Field(field.name, Reference(() => federatedGraphqlTypeToScalaType(field.ofType)), false, false, Nil, false)
+            }
+
+            typeMap.put(name,CaseClassType(name, caseClassFields, externalKeys = Option(keys.mkString(" "))))
+
+            List(ExternalEntity(name, externalFields, keys))
+          case TypeExtension.InterfaceTypeExtension(name, directives, fields) => Nil
+          case TypeExtension.UnionTypeExtension(name, directives, memberTypes) => Nil
+          case TypeExtension.EnumTypeExtension(name, directives, enumValuesDefinition) => Nil
+          case TypeExtension.InputObjectTypeExtension(name, directives, fields) => Nil
+        }
+      }
+    }
+  }
+
+
+  def checkExtensionValid(extensions: List[ObjectExtension], baseApi: Document): List[String] = {
     val objectsInBaseDoc = objectsInDocument(baseApi)
     extensions.flatMap { extension =>
       objectsInBaseDoc.find(_.name.contentEquals(extension.objectName)) match {
@@ -2193,7 +1715,14 @@ object PostgresSniffer {
           extension.field.requiredFields.flatMap { requiredField =>
             baseObject.fields.find(_.name.contentEquals(requiredField)) match {
               case Some(requiredFieldOnBaseObject) =>
-                if(!extension.field.fieldType.nullable && requiredFieldOnBaseObject.ofType.nullable) List(s"Object ${baseObject.name} has been extended with field ${extension.field.fieldName} with a nonnullable type. This field requires ${requiredFieldOnBaseObject.name} which is nullable. This does not fly.")
+                val extensionFieldNullable = extension.field.fieldType match {
+                  case containerType: ContainerType => containerType match {
+                    case ListType(elementType) => false
+                    case OptionType(elementType) => true
+                  }
+                  case _ => false
+                }
+                if(!extensionFieldNullable && requiredFieldOnBaseObject.ofType.nullable) List(s"Object ${baseObject.name} has been extended with field ${extension.field.fieldName} with a nonnullable type. This field requires ${requiredFieldOnBaseObject.name} which is nullable. This does not fly.")
                 else Nil
               case None =>
                 List(s"Obejct ${baseObject.name} does not have required field ${requiredField} needed for ${extension.field.fieldName}")
@@ -2218,11 +1747,45 @@ object Codegen extends App{
 
   val outputFile = dir / "boilerplate.scala"
 
-  val generatedBoilerPlate = tablesToBoilerplate(connToTables(conn), Nil)
+
+}
+
+object Extensions extends App {
+  import PostgresSniffer._
+  val _ = classOf[org.postgresql.Driver]
+  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
+  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+
+  val tables = connToTables(conn)
+
+  val extensionsFile = File("") / "lib" / "src" / "main"/ "resources" / "extensions.graphql"
+
+  val extensionDoc = parseDocument(parseExtensions(new java.io.File(extensionsFile.toURI)))
+  val federatedStuff = docToFederatedInstances(extensionDoc)
+  val extensions = docToObjectExtension(extensionDoc)
+
+  extensions.foreach(println)
 
 
-  outputFile.toFile.writeAll("package generated \n",generatedBoilerPlate)
 
+  federatedStuff.foreach(println)
+
+  println(to2CalibanBoilerPlate(tablesToTableAPI(tables, extensions), extensions, tables, federatedStuff))
+
+//  val baseApi = to2CalibanBoilerPlate(tablesToTableAPI(tables),extensions,tables)
+//
+//    println(baseApi)
+//
+//  val fileLocation = File("") / "lib" / "src" / "main"/ "scala"
+//  val dir = File(fileLocation) / "codegen2"
+//
+//  dir.createDirectory()
+//
+//  val outputFile = dir / "boilerplate.scala"
+//
+//  val generatedBoilerPlate = to2CalibanBoilerPlate(tablesToTableAPI(tables), extensions, tables)
+//
+//  outputFile.toFile.writeAll("package codegen2 \n",generatedBoilerPlate)
 }
 
 
@@ -2238,8 +1801,9 @@ object Render2 extends App {
 
   val extensionDoc = parseDocument(parseExtensions(new java.io.File(extensionsFile.toURI)))
   val extensions = docToObjectExtension(extensionDoc)
+  val externalEntities = docToFederatedInstances(extensionDoc)
 
-  val baseApi = to2CalibanBoilerPlate(tablesToTableAPI(tables),extensions,tables)
+  val baseApi = to2CalibanBoilerPlate(tablesToTableAPI(tables, extensions),extensions,tables, externalEntities)
 
 //  println(baseApi)
 
@@ -2250,7 +1814,7 @@ object Render2 extends App {
 
   val outputFile = dir / "boilerplate.scala"
 
-  val generatedBoilerPlate = to2CalibanBoilerPlate(tablesToTableAPI(tables), extensions, tables)
+  val generatedBoilerPlate = to2CalibanBoilerPlate(tablesToTableAPI(tables, extensions), extensions, tables, externalEntities)
 
   outputFile.toFile.writeAll("package codegen2 \n",generatedBoilerPlate)
 }
