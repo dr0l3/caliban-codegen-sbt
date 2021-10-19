@@ -34,7 +34,7 @@ import scala.tools.nsc.io.File
 
 sealed trait JsonPathPart
 case object ArrayPath extends JsonPathPart
-case class ObjectPath(fieldName: String) extends JsonPathPart
+case class ObjectPath(fieldName: String, typeTest: Option[String]) extends JsonPathPart
 
 
 case class ObjectExtensionField(fieldName: String, fieldType: ScalaType, requiredFields: List[String], isExternal: Boolean = false)
@@ -482,53 +482,53 @@ object Util {
     }
   }
 
-  def checkIfExtensionUsed(field: CField, extension: ObjectExtension, path: List[JsonPathPart]): List[List[JsonPathPart]] = {
-    println(s"CHECK EXTENSION USED: $extension ${field.fieldType.kind}. ${field.fieldType.name}")
-    field.fieldType.kind match {
-      case __TypeKind.SCALAR => Nil
-      case __TypeKind.OBJECT =>
-        println("OBJECT DETECTED")
-        if(checkObjectMatches(field, extension)) { // TODO: FIX
-          println(s"EXTENSION $extension USED IN OBJECT AT ${field.name}. PATH $path")
-          List(path)
-        } else {
-          field.fields
-            .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ObjectPath(field.name))))
-        }
-      case __TypeKind.INTERFACE => Nil
-      case __TypeKind.UNION => Nil
-      case __TypeKind.ENUM => Nil
-      case __TypeKind.INPUT_OBJECT => Nil
-      case __TypeKind.LIST =>
-        println("LIST DETECTED")
-        if(checkObjectMatches(field, extension)) {
-          println(s"EXTENSION $extension USED IN LIST AT ${field.name}. PATH $path")
-          List(path ++ List(ArrayPath))
-        } else {
-          println("RECURSING FROM LIST")
-          field.fields
-            .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ArrayPath, ObjectPath(field.name))))
-        }
-      case __TypeKind.NON_NULL =>
-        println("NON NULL DETECTED")
-        val includesArray = Util.includesArray(field.fieldType)
-        if(checkObjectMatches(field, extension)) {
-
-          println(s"EXTENSION $extension USED IN NON NULL AT ${field.name}. PATH $path")
-          if(includesArray) List(path ++ List(ArrayPath))
-          else
-            List(path)
-        } else {
-          if(includesArray) {
-            field.fields
-              .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ArrayPath,ObjectPath(field.name))))
-          } else
-            field.fields
-              .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ObjectPath(field.name))))
-        }
-    }
-
-  }
+//  def checkIfExtensionUsed(field: CField, extension: ObjectExtension, path: List[JsonPathPart]): List[List[JsonPathPart]] = {
+//    println(s"CHECK EXTENSION USED: $extension ${field.fieldType.kind}. ${field.fieldType.name}")
+//    field.fieldType.kind match {
+//      case __TypeKind.SCALAR => Nil
+//      case __TypeKind.OBJECT =>
+//        println("OBJECT DETECTED")
+//        if(checkObjectMatches(field, extension)) { // TODO: FIX
+//          println(s"EXTENSION $extension USED IN OBJECT AT ${field.name}. PATH $path")
+//          List(path)
+//        } else {
+//          field.fields
+//            .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ObjectPath(field.name))))
+//        }
+//      case __TypeKind.INTERFACE => Nil
+//      case __TypeKind.UNION => Nil
+//      case __TypeKind.ENUM => Nil
+//      case __TypeKind.INPUT_OBJECT => Nil
+//      case __TypeKind.LIST =>
+//        println("LIST DETECTED")
+//        if(checkObjectMatches(field, extension)) {
+//          println(s"EXTENSION $extension USED IN LIST AT ${field.name}. PATH $path")
+//          List(path ++ List(ArrayPath))
+//        } else {
+//          println("RECURSING FROM LIST")
+//          field.fields
+//            .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ArrayPath, ObjectPath(field.name))))
+//        }
+//      case __TypeKind.NON_NULL =>
+//        println("NON NULL DETECTED")
+//        val includesArray = Util.includesArray(field.fieldType)
+//        if(checkObjectMatches(field, extension)) {
+//
+//          println(s"EXTENSION $extension USED IN NON NULL AT ${field.name}. PATH $path")
+//          if(includesArray) List(path ++ List(ArrayPath))
+//          else
+//            List(path)
+//        } else {
+//          if(includesArray) {
+//            field.fields
+//              .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ArrayPath,ObjectPath(field.name))))
+//          } else
+//            field.fields
+//              .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ObjectPath(field.name))))
+//        }
+//    }
+//
+//  }
 
   def createModification(transformer: JsonObject => ZIO[Any, Nothing, JsonObject], path: List[JsonPathPart]): Json => ZIO[Any,Nothing, Json] = {
     import zio.interop.catz._
@@ -540,7 +540,7 @@ object Util {
           case ObejctPathWrapper(path) => ArrayPathWrapper(path.each)
           case ArrayPathWrapper(path) => ArrayPathWrapper(path.each)
         }
-        case ObjectPath(fieldName) => acc match {
+        case ObjectPath(fieldName, typeTest) => acc match {
           case ObejctPathWrapper(path) => ObejctPathWrapper(path.selectDynamic(fieldName))
           case ArrayPathWrapper(path) => ArrayPathWrapper(path.selectDynamic(fieldName))
         }
@@ -551,14 +551,14 @@ object Util {
     }
   }
 
-  def createExtensionModifications(field: CField, extensions: Map[ObjectExtension, JsonObject => ZIO[Any,Nothing,JsonObject]]): List[Json => ZIO[Any, Nothing,Json]] = {
-    extensions.flatMap { case (extension, transformer) =>
-      checkIfExtensionUsed(field, extension, Nil).map(path => path -> transformer)
-    }.map { case (path, transformer) =>
-      println(s"PATH: $path has transformer")
-      createModification(transformer, path)
-    }.toList
-  }
+//  def createExtensionModifications(field: CField, extensions: Map[ObjectExtension, JsonObject => ZIO[Any,Nothing,JsonObject]]): List[Json => ZIO[Any, Nothing,Json]] = {
+//    extensions.flatMap { case (extension, transformer) =>
+//      checkIfExtensionUsed(field, extension, Nil).map(path => path -> transformer)
+//    }.map { case (path, transformer) =>
+//      println(s"PATH: $path has transformer")
+//      createModification(transformer, path)
+//    }.toList
+//  }
 
   def argToWhereClause(key: String, value: InputValue): String = {
     value match {
@@ -735,7 +735,8 @@ object Util {
   //
   def toQueryWithJson(intermediate: Intermediate, fieldNameOfObject: String, condition: Option[String]): String = {
     val dataId = s"${fieldNameOfObject}_data"
-    val cols = intermediate.cols.map { col =>
+    val typeName = List(s"'${intermediate.from.tableName}' as __typename")
+    val cols = typeName ++ intermediate.cols.map { col =>
       s""""$dataId"."$col""""
     } ++ intermediate.from.joins.map { join =>
 
@@ -1384,7 +1385,7 @@ object PostgresSniffer {
          |   import EntityResolvers._
          |   val tables = $tableList
          |
-         |   val extensionLogicByType: ExtensionLogicMap = Map(
+         |   val extensionLogicByType: ExtensionLogicMap = List(
          |      ${extensionLogicEntries.mkString(",\n")}
          |   )
          |
@@ -1508,7 +1509,7 @@ object PostgresSniffer {
       case Type.NamedType(name, nonNull) => name match {
         case "Int" => IntegerType
         case "String" => StringType
-        case "ID" => StringType
+        case "ID" => UUIDType
         case _ => typeMap(name)
       }
       case Type.ListType(ofType, nonNull) =>ListType(federatedGraphqlTypeToScalaType(ofType))
