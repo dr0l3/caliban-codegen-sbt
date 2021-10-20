@@ -1202,6 +1202,18 @@ object PostgresSniffer {
     }
   }
 
+  def usedTypes(tpe: ScalaType): List[String] = {
+    tpe match {
+      case baseType: BaseType => List(baseType.name)
+      case containerType: ContainerType => containerType match {
+        case ListType(elementType) => usedTypes(elementType)
+        case OptionType(elementType) => usedTypes(elementType)
+      }
+      case CaseClassType(name, fields, isBaseTableClass, isInsertForTable, isUpdateForTable, isDeleteForTable, isFederationArg, externalKeys) =>
+        fields.flatMap(field =>usedTypes(field.scalaType.strict()))
+    }
+  }
+
   def to2CalibanBoilerPlate(apis: List[TableAPI], extensions: List[ObjectExtension], tables: List[Table], externalEntities: List[ExternalEntity]): String = {
     val imports =
       """
@@ -1247,6 +1259,20 @@ object PostgresSniffer {
         s"$annotations ${field.name}: ${federatedGraphqlTypeToScalaType(field.tpe).name}"
       }
       s"""@GQLDirective(Extend) @GQLDirective(Key(${externalEntity.keys.mkString(" ")}))case class ${externalEntity.name}(${fields.mkString(",")})"""
+    }
+
+    val reachableTypenames = apis.map(api => api.caseClass).flatMap(usedTypes(_))
+    val unreacheableTypes = externalEntities
+      .filterNot { externalEntity => reachableTypenames.exists(_.contentEquals(externalEntity.name))}
+
+    val unreachableTypeMethods = unreacheableTypes
+      .map { externalEntity =>
+        val typeName = externalEntity.name
+        s"def create${typeName}Schema()(implicit schema: Schema[Any, ${typeName}]) : __Type = schema.toType_()"
+      }
+
+    val unreachableTypeInvocations = unreacheableTypes.map { unreachableType =>
+      s"create${unreachableType.name}Schema()"
     }
 
     // Extension Args
@@ -1354,6 +1380,12 @@ object PostgresSniffer {
          |}""".stripMargin
     }
 
+    val unreachableTypesObjet =
+      s"""object UnreachableTypes {
+         |   ${unreachableTypeMethods.mkString("\n")}
+         |}""".stripMargin
+
+
     val entityResolvers =
       s"""object EntityResolvers {
         | ${entityResolverMethods.mkString("\n")}
@@ -1390,6 +1422,7 @@ object PostgresSniffer {
     val apiClass =
       s"""class API(extensions: Extensions, connection: Connection)(implicit val querySchema: Schema[Any, Queries], mutationSchema: Schema[Any, Mutations]) {
          |   import EntityResolvers._
+         |   import UnreachableTypes._
          |   val tables = $tableList
          |
          |   val extensionLogicByType: ExtensionLogicMap = List(
@@ -1441,7 +1474,7 @@ object PostgresSniffer {
          |               ): GraphQL[Any] = {
          |    federate(
          |      $federationInvocationParams
-         |    )
+         |    ).withAdditionalTypes(List(${unreachableTypeInvocations.mkString(", ")}))
          |  }
          |}
          |""".stripMargin
@@ -1468,6 +1501,8 @@ object PostgresSniffer {
        |$extensionTrait
        |
        |$entityResolvers
+       |
+       |$unreachableTypesObjet
        |
        |$apiClass
        |""".stripMargin
