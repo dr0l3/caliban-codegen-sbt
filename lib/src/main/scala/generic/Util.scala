@@ -578,7 +578,6 @@ object Util {
 
     // We have created an intermediate that has filtered out all the fields that have @requires
     val intermediate = toIntermediate(field, tables, "root", extensions.map(_._1).toList)
-    val fieldMask: List[Json => Json] = Nil // Transformations for removing the fields that were added to satisfy extensions
 
 
     // Three types
@@ -600,27 +599,14 @@ object Util {
                        |
                        |""".stripMargin
 
-
-    println(fullQuery)
-
-    // Compute the modifications
-//    val extensionModifications = createExtensionModifications(
-//      isEntityResolverQuery = false,
-//      field,
-//      extensions.mapValues(f => f(field)).toMap
-//    )
-
-
     val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {case (path, tpe) => path -> tpe}
     val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
-//    val extensionCoordinates = createExtensionModifications2(true, field, extensions.mapValues(v => v.apply(field)))
 
 
     val stuff =
       s"""|DEBUGGING
           |${printQuery(field)}
           |$cooridnatesDebug""".stripMargin
-    println(stuff)
     val typeNameInsertions = constructTypenameInserters(coordinatesForTypenameQueries)
 
     // Prepare the statement
@@ -638,10 +624,10 @@ object Util {
         resultSet.getString("root")
       }
       resultAsJson <- ZIO.fromEither(io.circe.parser.parse(resultString))
-      //        resultWithExtensions <- extensionModifications.foldLeft(ZIO(resultAsJson))((acc,next) => acc.flatMap(next(_)))
       resultWithExtensions <- applyExtensions2(field,extensions.map{case (k,v) => k -> v.apply(field)}, resultAsJson, false)
       resultWithTypeNames = typeNameInsertions.foldLeft(resultWithExtensions)((acc, next) => next(acc))
-      resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultWithTypeNames))
+      resultStripped = stripUnwantedStuff(resultWithTypeNames, field)
+      resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultStripped))
       debugPrint =
         s"""
            |----------------------------------------
@@ -655,6 +641,8 @@ object Util {
            |$resultWithExtensions
            |DatabaseResult with extensions and typename
            |$resultWithTypeNames
+           |ResultStripped
+           |$resultStripped
            |--------------------------------------
            |""".stripMargin
       _ <- ZIO(println(debugPrint))
@@ -664,29 +652,18 @@ object Util {
   def genericQueryHandler[R](tables: List[Table], extensions: ExtensionLogicMap, connection: Connection)(field: Field): Step[R] = QueryStep(ZQuery.fromEffect(ZIO{
     // We have created an intermediate that has filtered out all the fields that have @requires
     val intermediate = toIntermediate(field, tables, "root", extensions.map(_._1))
-    val fieldMask: List[Json => Json] = Nil // Transformations for removing the fields that were added to satisfy extensions
 
     val condition = field.arguments.map { case (k, v) => argToWhereClause(k, v) }.mkString(" AND ")
     val query = toQueryWithJson(intermediate, "root", Option(condition))
 
-    println(query)
-    // Compute the modifications
-//    val extensionModifications = createExtensionModifications(
-//      isEntityResolverQuery = false,
-//      field,
-//      extensions.mapValues(f => f(field)).toMap
-//    )
-
     val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {case (path, tpe) => path -> tpe}
     val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
-//    val extensionCoordinates = createExtensionModifications2(true, field, extensions.mapValues(v => v.apply(field)))
 
 
     val stuff =
       s"""|DEBUGGING
           |${printQuery(field)}
           |$cooridnatesDebug""".stripMargin
-    println(stuff)
     val typeNameInsertions = constructTypenameInserters(coordinatesForTypenameQueries)
 
     // Prepare the statement
@@ -704,10 +681,10 @@ object Util {
         resultSet.getString("root")
       }
       resultAsJson <- ZIO.fromEither(io.circe.parser.parse(resultString))
-      //        resultWithExtensions <- extensionModifications.foldLeft(ZIO(resultAsJson))((acc,next) => acc.flatMap(next(_)))
       resultWithExtensions <- applyExtensions2(field,extensions.map{case (k,v) => k -> v.apply(field)}, resultAsJson, false)
       resultWithTypeNames = typeNameInsertions.foldLeft(resultWithExtensions)((acc, next) => next(acc))
-      resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultWithTypeNames))
+      resultStripped = stripUnwantedStuff(resultWithTypeNames, field)
+      resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultStripped))
       debugPrint =
         s"""
            |----------------------------------------
@@ -721,6 +698,8 @@ object Util {
            |$resultWithExtensions
            |DatabaseResult with extensions and typename
            |$resultWithTypeNames
+           |ResultStripped
+           |$resultStripped
            |--------------------------------------
            |""".stripMargin
       _ <- ZIO(println(debugPrint))
@@ -777,6 +756,45 @@ object Util {
     }
   }
 
+  def effectiveKind(tpe: __Type): __TypeKind = {
+    tpe.kind match {
+      case __TypeKind.NON_NULL => tpe.ofType.map(effectiveKind).getOrElse(throw new RuntimeException("NONNULL has no nested type: Should never happne"))
+      case other => other
+    }
+  }
+
+  def stripUnwantedStuff(json: Json, field: Field): Json = {
+    println(s"STRIP UNWANTED STUFF(${field.name}, ${effectiveKind(field.fieldType)}) -> ${json}")
+    field.fieldType.kind match {
+      case __TypeKind.SCALAR => json
+      case __TypeKind.OBJECT =>
+        json.asObject match {
+          case Some(value) =>
+            val requestedFieldsOnThisLevel = field.fields
+            value.keys.map(key => key -> requestedFieldsOnThisLevel.find(_.name.contentEquals(key))).foldLeft(value) { case (json, (key, fieldForKey)) =>
+              fieldForKey match {
+                case Some(recursiveField) =>
+                  val recursive = JsonObject(key -> stripUnwantedStuff(json(key).get, recursiveField))
+                  json.deepMerge(recursive)
+
+                case None => json.remove(key)
+              }
+            }.asJson
+
+          case None => json
+        }
+      case __TypeKind.INTERFACE => json
+      case __TypeKind.UNION => json
+      case __TypeKind.ENUM => json
+      case __TypeKind.INPUT_OBJECT => json
+      case __TypeKind.LIST =>
+        val withPatchedKind = field.copy(fieldType = field.fieldType.ofType.getOrElse(throw new RuntimeException("List has no inner type: Should never happen")))
+        json.asArray.getOrElse(Nil).map(json => stripUnwantedStuff(json,withPatchedKind)).toList.asJson
+      case __TypeKind.NON_NULL =>
+        stripUnwantedStuff(json, field.copy(fieldType = field.fieldType.ofType.getOrElse(throw new RuntimeException("NON_NULL has no inner type: Should never happen"))))
+    }
+  }
+
 
   def printQuery(field: Field, indent: String = ""): String = {
     s"""|$indent${field.name}
@@ -798,9 +816,6 @@ object Util {
       val query = toQueryWithJson(intermediate, "root", Option(condition))
       println(query)
 
-      // Compute the modifications
-//      val extensionModifications = createExtensionModifications(isEntityResolverQuery = true,field, extensions.mapValues(f => f(field)).toMap) // TODO: Reconsider
-//      val extensionCoordinates = createExtensionModifications2(true, field, extensions.mapValues(v => v.apply(field)))
 
       // Prepare the statement
       // Execute the query
@@ -831,10 +846,12 @@ object Util {
           resultSet.getString("root")
         }
         resultAsJson <- ZIO.fromEither(io.circe.parser.parse(resultString))
-//        resultWithExtensions <- extensionModifications.foldLeft(ZIO(resultAsJson))((acc,next) => acc.flatMap(next(_)))
         resultWithExtensions <- applyExtensions2(field,extensions.map{case (k,v) => k -> v.apply(field)}, resultAsJson, true)
         resultWithTypeNames = typeNameInsertions.foldLeft(resultWithExtensions)((acc, next) => next(acc))
-        resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultWithTypeNames))
+        // Entity queries always return non null list of non null
+        whatever = field.copy(fieldType = field.fieldType.ofType.flatMap(_.ofType).getOrElse(throw new RuntimeException("Entity resolver query does not have inner type of inner type: Should never happen")))
+        resultStripped = stripUnwantedStuff(resultWithTypeNames, whatever)
+        resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultStripped))
         debugPrint =
           s"""
              |----------------------------------------
@@ -848,6 +865,8 @@ object Util {
              |$resultWithExtensions
              |DatabaseResult with extensions and typename
              |$resultWithTypeNames
+             |ResultStripped
+             |$resultStripped
              |--------------------------------------
              |""".stripMargin
         _ <- ZIO(println(debugPrint))

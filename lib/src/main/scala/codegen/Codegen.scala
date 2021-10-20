@@ -585,9 +585,12 @@ object Util {
       val table = tables.find(_.name.contentEquals(tableName.mkString(""))).getOrElse(throw new RuntimeException(s"Unable to find table for ${tableName.mkString("")}"))
       val extensionColumnsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
       val (queriedCols, recurseCases) = field.fields.partition(_.fields.isEmpty) // TODO: Do dependency analysis
+      val extensionsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
+      val requirementsFromExtensions = extensionsForThisTable.flatMap(_.requirements)
       // SELECT: id, name
       // FROM tablename
-      val recursiveCases = recurseCases.filterNot(field => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(field.name)))
+      val recursiveCases = recurseCases
+        .filterNot(field => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(field.name))) // Don't recurse on extension columns
         .map(f =>
           toIntermediate(f, tables, s"${layerName}.${f.name}", extensions)
         )
@@ -609,10 +612,11 @@ object Util {
       println(s"COL AND DIRS: ${queriedCols.map(col => col.name -> col.directives.map(_.name))}")
 
 
-
+      val cols = (queriedCols
+        .filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name)) ++ requirementsFromExtensions // Dont select extension columns, but do select the extensions requirements
 
       Intermediate(
-        queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name),
+        cols,
         IntermediateFrom(table.name, recursiveCases),
         field
           .copy(fieldType = field.fieldType.copy(kind = __TypeKind.OBJECT)) // TODO: Annoying hack needed to "cast" the output to an object due to calibans weird handling of entityresolvers
@@ -632,6 +636,8 @@ object Util {
     val table = tables.find(_.name.contentEquals(tableName.mkString(""))).getOrElse(throw new RuntimeException(s"Unable to find table for ${tableName.mkString("")}"))
     val extensionColumnsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
     val (queriedCols, recurseCases) = field.fields.filterNot(_.name.contentEquals("__typename")).partition(_.fields.isEmpty) // TODO: Do dependency analysis
+    val extensionsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
+    val requirementsFromExtensions = extensionsForThisTable.flatMap(_.requirements)
     // SELECT: id, name
     // FROM tablename
     val recursiveCases = recurseCases.filterNot(field => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(field.name)))
@@ -657,7 +663,7 @@ object Util {
 
 
 
-    Intermediate(queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name), IntermediateFrom(table.name, recursiveCases), field)
+    Intermediate((queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name) ++ requirementsFromExtensions).distinct, IntermediateFrom(table.name, recursiveCases), field)
   }
 
   def compileFrom(intermediate: Intermediate, top: Boolean): String = {
@@ -1358,7 +1364,8 @@ object PostgresSniffer {
     val extensionLogicEntries = extensions.map { extension =>
       val extensionInputType = s"${extension.objectName}${extension.field.fieldName}ExtensionArgs"
       val extensionMethodName = s"${extension.objectName}${extension.field.fieldName}"
-      s"""ExtensionPosition("${extension.objectName}","${extension.field.fieldName}") -> middleGenericJsonObject[$extensionInputType,${extension.field.fieldType.name}](extensions.${extensionMethodName})("${extension.field.fieldName}")"""
+      val requiredFields = extension.field.requiredFields.map(reqField => s""""$reqField"""").mkString(",")
+      s"""ExtensionPosition("${extension.objectName}","${extension.field.fieldName}", List($requiredFields)) -> middleGenericJsonObject[$extensionInputType,${extension.field.fieldType.name}](extensions.${extensionMethodName})("${extension.field.fieldName}")"""
     }
 
     val insertByFieldNameEntries = apis.flatMap(_.insert).map { insertOp =>
