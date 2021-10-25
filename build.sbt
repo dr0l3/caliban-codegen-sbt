@@ -30,6 +30,8 @@ lazy val lib = project.in(file("lib")).settings(
   libraryDependencies += "io.circe" %% "circe-optics" % "0.14.1",
   libraryDependencies += "io.circe" %% "circe-generic" % "0.14.1",
   libraryDependencies += "dev.zio" %% "zio-interop-cats" % "3.1.1.0",
+  libraryDependencies += "com.lihaoyi" %% "fastparse" % "2.2.2",
+  libraryDependencies += "dev.zio" %% "zio-prelude" % "1.0.0-RC6",
   libraryDependencies ++= {
     CrossVersion.partialVersion(scalaVersion.value) match {
       case Some((2,n)) if n == 12 => Seq(compilerPlugin(
@@ -69,21 +71,10 @@ lazy val plugin = project.in(file("plugin"))
     organization := "droletours",
     name := "caliban-postgres-sbt",
     libraryDependencies += "org.postgresql" % "postgresql" % "42.2.24",
-//    libraryDependencies ++= {
-//      CrossVersion.partialVersion(scalaVersion.value) match {
-//        case Some((2, n)) if n == 12 => List(
-//          "com.github.ghostdogpr" %% "caliban" % "1.1.1+59-f6079748+20211017-1605-SNAPSHOT",
-//          "com.github.ghostdogpr" %% "caliban-federation" % "1.1.1+59-f6079748+20211017-1605-SNAPSHOT",
-//        )
-//        case Some((2, n)) if n == 13 => List(
-//          "com.github.ghostdogpr" %% "caliban" % "1.1.1+59-f6079748+20211017-1606-SNAPSHOT",
-//          "com.github.ghostdogpr" %% "caliban-federation" % "1.1.1+59-f6079748+20211017-1606-SNAPSHOT",
-//        )
-//        case _ => Nil
-//      }
-//    },
-//    scriptedDependencies :={
-//      (lib / publishLocal).value
-//    }
+    scriptedLaunchOpts := { scriptedLaunchOpts.value ++
+      Seq("-Xmx1024M", "-Dplugin.version=" + version.value)
+    },
+    scriptedBufferLog := false
+
   )
   .dependsOn(lib)

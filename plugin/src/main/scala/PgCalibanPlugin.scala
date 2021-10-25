@@ -5,6 +5,9 @@ import codegen.PostgresSniffer.{connToTables, docToFederatedInstances, docToObje
 
 import java.sql.DriverManager
 import codegen._
+import zio.{Schedule, ZIO, duration}
+
+import java.util.concurrent.TimeUnit
 
 object PgCalibanPlugin extends AutoPlugin {
   object autoImport {
@@ -39,7 +42,10 @@ object PgCalibanPlugin extends AutoPlugin {
       Class.forName("org.postgresql.Driver")
       val _ = classOf[org.postgresql.Driver]
       val con_str = pgCalibanPostgresConnectionUrl.value
-      val conn = DriverManager.getConnection(con_str, pgCalibanPostgresUser.value, pgCalibanPostgresPassword.value)
+      DriverManager.setLoginTimeout(5)
+      println(s"STARTING CONNECTION TO ${con_str}")
+      val conn = zio.Runtime.default.unsafeRun(ZIO(DriverManager.getConnection(con_str, pgCalibanPostgresUser.value, pgCalibanPostgresPassword.value)).timeout(duration.Duration(1, TimeUnit.SECONDS)).retry(Schedule.exponential(duration.Duration(1, TimeUnit.SECONDS),2).upTo(duration.Duration(30, TimeUnit.SECONDS)))).get
+      println("CONNECTION ESTABLISHED")
 
       val tables = connToTables(conn)
 

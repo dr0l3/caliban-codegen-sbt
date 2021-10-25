@@ -16,7 +16,7 @@ import caliban.wrappers.Wrapper
 import cats.Applicative
 import codegen.PostgresSniffer.typeMap
 import codegen.Util.{extractTypeName, typeToScalaType, typeTo__Type}
-import generic.Util.ExtensionPosition
+import generic.Util.{ExtensionPosition, genericQueryHandler}
 //import codegen.Runner.api
 import fastparse.parse
 import io.circe.optics.JsonPath.root
@@ -65,6 +65,66 @@ case class IntermediateFrom(tableName: String, joins: List[IntermediateJoin])
 
 case class Intermediate(cols: List[String], from: IntermediateFrom, field: CField)
 
+
+// A table will at least be an object so no need to support scalars
+sealed trait SQLResponseType
+case object ObjectResponse extends SQLResponseType
+case object ListResponse extends SQLResponseType
+case class Optional(inner: SQLResponseType) extends SQLResponseType
+
+case class IntermediateColumn(nameInTable: String, outputName: String) // What about function columns?
+case class IntermediateJoinV2(leftColName: String, rightColName: String, right: IntermediateV2, name: String)
+
+case class IntermediateFromV2(tableName: String, joins: List[IntermediateJoinV2]) // What about functions?
+sealed trait IntermediateV2
+case class IntermediateV2Regular(
+                                  cols: List[IntermediateColumn],
+                                  from: IntermediateFromV2,
+                                  responseType: SQLResponseType,
+                                  condition: Option[String],
+                                  ordering: Option[String]
+                                ) extends IntermediateV2
+case class IntermediateV2Union(
+                                discriminatorFieldName: String,
+                                discriminatorMapping: Map[String, List[IntermediateColumn]],
+                                from: IntermediateFromV2,
+                                responseType: SQLResponseType,
+                                condition: Option[String],
+                                ordering: Option[String]
+                              ) extends IntermediateV2
+
+case class IntermediateUnion(discriminatorColumn: String, columnsByDiscriminatorValue: Map[String, List[String]]) {
+  def toSQL(field: CField) : String =  {
+    val baseTableName = "whatever"
+    val childrenTypesFetched = field.fields.flatMap(_.parentType).flatMap(_.name).distinct
+    childrenTypesFetched match {
+      case Nil => ""
+      case ::(head, Nil) => ""
+      case ::(head, tl) =>
+        val childTypeSQL = columnsByDiscriminatorValue.map { case (tpe, columns) =>
+          val queriedFieldsForThisType = field.fields.filter(_.parentType.flatMap(_.name).exists(_.contentEquals(tpe)))
+          val columnEntries = columns
+            .filter(column => queriedFieldsForThisType.exists(_.name.contentEquals(column)))
+            .map { column =>
+              s"""'$column', "${baseTableName}_data"."$column""""
+            } ++ List(s"""'__typename', '${tpe}'""")
+
+          s"""when "${baseTableName}_data"."$discriminatorColumn" = '${tpe}'
+             |    then json_build_object(${columnEntries.mkString(",")})""".stripMargin
+        }
+        s"""select "json_spec"."object"
+           |from (
+           |  select case ${childTypeSQL.mkString("\n")}
+           |              end as "object"
+           |) as "json_spec"
+           |
+           |""".stripMargin
+    }
+
+
+  }
+}
+
 case class FunctionInfo(name: String, comments: String, functionType: Short)
 
 case class FunctionColumnInfo(functionName: String, columnName: String, columnType: Short, dataType: Int, typeName: String, nullable: Boolean, comments: String)
@@ -95,6 +155,8 @@ case class Column(name: String, nullable: Boolean, sqltype: Int, typeName: Strin
   def renderSelf(): String = {
     s"""Column("$name", $nullable, $sqltype, "$typeName", $unique)"""
   }
+
+  def matchesName(name: String): Boolean = this.name.contentEquals(name)
 }
 
 
@@ -105,6 +167,8 @@ case class Table(name: String, primaryKeys: List[Column], otherColumns: List[Col
     val renderedRelationships = relationships.map(_.renderSelf()).mkString("List(", ",", ")")
     s"""Table("${name}", $renderedPrimaryKeys, $renderedOtherColumns, "$comments", $renderedRelationships)"""
   }
+
+  def matchesName(name: String): Boolean = this.name.contentEquals(name)
 }
 
 
@@ -364,8 +428,6 @@ case class TableAPI(
 
 object Util {
 
-
-
   def typeTo__Type(tpe: Type): __Type = {
     tpe match {
       case Type.NamedType(name, nonNull) =>
@@ -407,17 +469,13 @@ object Util {
   }
 
   def checkExtensionApplies(tpe: __Type, extension :ObjectExtension): Boolean =  {
-
     val name = Util.extractTypeName(tpe)
 
     if(name.contentEquals(extension.objectName)) {
-      //      println(s"checkExtensionApplies: ${name} -> ${extension.objectName} -> TRUE")
       true
     } else {
-      //      println(s"checkExtensionApplies: ${name} -> ${extension.objectName} -> FALSE")
       false
     }
-
   }
 
   def extendType(tpe: __Type, extensions: List[ObjectExtension]): __Type = {
@@ -482,53 +540,6 @@ object Util {
     }
   }
 
-//  def checkIfExtensionUsed(field: CField, extension: ObjectExtension, path: List[JsonPathPart]): List[List[JsonPathPart]] = {
-//    println(s"CHECK EXTENSION USED: $extension ${field.fieldType.kind}. ${field.fieldType.name}")
-//    field.fieldType.kind match {
-//      case __TypeKind.SCALAR => Nil
-//      case __TypeKind.OBJECT =>
-//        println("OBJECT DETECTED")
-//        if(checkObjectMatches(field, extension)) { // TODO: FIX
-//          println(s"EXTENSION $extension USED IN OBJECT AT ${field.name}. PATH $path")
-//          List(path)
-//        } else {
-//          field.fields
-//            .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ObjectPath(field.name))))
-//        }
-//      case __TypeKind.INTERFACE => Nil
-//      case __TypeKind.UNION => Nil
-//      case __TypeKind.ENUM => Nil
-//      case __TypeKind.INPUT_OBJECT => Nil
-//      case __TypeKind.LIST =>
-//        println("LIST DETECTED")
-//        if(checkObjectMatches(field, extension)) {
-//          println(s"EXTENSION $extension USED IN LIST AT ${field.name}. PATH $path")
-//          List(path ++ List(ArrayPath))
-//        } else {
-//          println("RECURSING FROM LIST")
-//          field.fields
-//            .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ArrayPath, ObjectPath(field.name))))
-//        }
-//      case __TypeKind.NON_NULL =>
-//        println("NON NULL DETECTED")
-//        val includesArray = Util.includesArray(field.fieldType)
-//        if(checkObjectMatches(field, extension)) {
-//
-//          println(s"EXTENSION $extension USED IN NON NULL AT ${field.name}. PATH $path")
-//          if(includesArray) List(path ++ List(ArrayPath))
-//          else
-//            List(path)
-//        } else {
-//          if(includesArray) {
-//            field.fields
-//              .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ArrayPath,ObjectPath(field.name))))
-//          } else
-//            field.fields
-//              .flatMap(field => checkIfExtensionUsed(field, extension, path ++ List(ObjectPath(field.name))))
-//        }
-//    }
-//
-//  }
 
   def createModification(transformer: JsonObject => ZIO[Any, Nothing, JsonObject], path: List[JsonPathPart]): Json => ZIO[Any,Nothing, Json] = {
     import zio.interop.catz._
@@ -551,18 +562,9 @@ object Util {
     }
   }
 
-//  def createExtensionModifications(field: CField, extensions: Map[ObjectExtension, JsonObject => ZIO[Any,Nothing,JsonObject]]): List[Json => ZIO[Any, Nothing,Json]] = {
-//    extensions.flatMap { case (extension, transformer) =>
-//      checkIfExtensionUsed(field, extension, Nil).map(path => path -> transformer)
-//    }.map { case (path, transformer) =>
-//      println(s"PATH: $path has transformer")
-//      createModification(transformer, path)
-//    }.toList
-//  }
-
   def argToWhereClause(key: String, value: InputValue): String = {
     value match {
-      case InputValue.ListValue(values) => "" //TODO
+      case InputValue.ListValue(values) => s"$key in [] " //TODO
       case InputValue.ObjectValue(fields) => "" //TODO
       case InputValue.VariableValue(name) => "" //TODO
       case value: Value => value match {
@@ -571,7 +573,7 @@ object Util {
         case value: Value.FloatValue => s"$key = $value"
         case Value.StringValue(value) => s"$key = '${value}'"
         case Value.BooleanValue(value) => s"$key = $value"
-        case Value.EnumValue(value) => s"$key = '$value''"
+        case Value.EnumValue(value) => s"$key = '$value'"
       }
     }
   }
@@ -664,6 +666,94 @@ object Util {
 
 
     Intermediate((queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name) ++ requirementsFromExtensions).distinct, IntermediateFrom(table.name, recursiveCases), field)
+  }
+
+  def extractUnwrappedTypename(tpe: __Type): String = {
+    tpe.kind match {
+      case __TypeKind.SCALAR => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.OBJECT => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.INTERFACE => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.UNION => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.ENUM => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.INPUT_OBJECT => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.LIST => extractUnwrappedTypename(tpe.ofType.getOrElse(throw new RuntimeException("Should never happen")))
+      case __TypeKind.NON_NULL => extractUnwrappedTypename(tpe.ofType.getOrElse(throw new RuntimeException("Should never happen")))
+    }
+  }
+
+  def findTableFromFieldType(fieldType: __Type, tables: List[Table]): Table = {
+    val unwrappedTypename = extractUnwrappedTypename(fieldType)
+    tables.find(_.matchesName(unwrappedTypename)).getOrElse(throw new RuntimeException("Unable to find table from type"))
+  }
+
+  def fieldToSQLResponseType(fieldType: __Type, nullable: Boolean): SQLResponseType = {
+    fieldType.kind match {
+      case __TypeKind.SCALAR => ???
+      case __TypeKind.OBJECT  => if(nullable) ObjectResponse else Optional(ObjectResponse)
+      case __TypeKind.INTERFACE => if(nullable) ObjectResponse else Optional(ObjectResponse)
+      case __TypeKind.UNION => if(nullable) ObjectResponse else Optional(ObjectResponse)
+      case __TypeKind.ENUM => ???
+      case __TypeKind.INPUT_OBJECT => ???
+      case __TypeKind.LIST => ListResponse
+      case __TypeKind.NON_NULL => fieldToSQLResponseType(fieldType.ofType.getOrElse(throw new RuntimeException("Should never happen")), false)
+    }
+  }
+
+  def extractOrdering(field: CField): Option[String] = {
+    //TODO
+    None
+  }
+
+  def extractCondition(field: CField): Option[String] = {
+    //TODO
+    None
+  }
+
+  def toIntermediateV2(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition]): IntermediateV2 = {
+    // Find the table
+    val table = findTableFromFieldType(field.fieldType, tables)
+    // Extension fields
+    val (extensionFields, sqlFields) = field.fields.partition(f => extensions.exists(_.matchesField(f)))
+    // Find the columns we fetch from this table
+    // Find the recursive cases
+    val (tableFields, recursiveFields) = sqlFields.partition(f => (table.primaryKeys++table.otherColumns).exists(_.matchesName(f.name)))
+
+    // Recurse on the recursive cases (joins)
+    val joins = recursiveFields
+      .map(field => toIntermediateV2(field, tables, s"${layerName}.${field.name}", extensions))
+      .map { otherTable =>
+        val otherTableName = otherTable match {
+          case IntermediateV2Regular(cols, from, responseType, condition, ordering) => from.tableName
+          case IntermediateV2Union(discriminatorFieldName, discriminatorMapping, from, responseType, condition, ordering) => from.tableName
+        }
+
+        // Find the link between the tables, it has to exist
+        // First check if this table is the primary key table
+        // Then check if this table is the foreign key table
+        table.relationships
+          .find { relationshipTable => relationshipTable.pkTableName == table.name && relationshipTable.fkTableName == otherTableName }
+          .map(link => IntermediateJoinV2(link.pkColumnName, link.fkColumnName, otherTable, "TODO"))
+          .orElse(table.relationships
+            .find { relationshipTable => relationshipTable.fkTableName == table.name && relationshipTable.pkTableName == otherTableName}
+            .map(link => IntermediateJoinV2(link.fkColumnName, link.pkColumnName, otherTable, "TODO"))
+          )
+          .getOrElse(throw new RuntimeException(s"Unable to find link between ${table.name} and ${otherTable} required by ${field}"))
+      }
+
+    // Fetch any columns the extensions depend on
+    val usedExtensions = extensions.filter(extension => extension.objectName.contentEquals(table.name) && field.fields.exists(_.name.contentEquals(extension.fieldName)))
+    val requirementsFromExtensions = usedExtensions.flatMap(_.requirements)
+    val responseType = fieldToSQLResponseType(field.fieldType, nullable = true)
+    val ordering = extractOrdering(field)
+    val condition = extractCondition(field)
+
+    val requirementsColumns = requirementsFromExtensions.map(requiredField => IntermediateColumn(requiredField, requiredField))
+    val tableColumns = tableFields
+      .map(field => field -> (table.primaryKeys ++ table.otherColumns).find(_.matchesName(field.name)))
+      .map{case (field, column) => IntermediateColumn(column.getOrElse(throw new RuntimeException("Should never happen")).name, field.alias.getOrElse(field.name))}
+
+    IntermediateV2Regular(requirementsColumns ++ tableColumns, IntermediateFromV2(table.name, joins),responseType, condition, ordering)
+
   }
 
   def compileFrom(intermediate: Intermediate, top: Boolean): String = {
@@ -1862,44 +1952,44 @@ object Render2 extends App {
   outputFile.toFile.writeAll("package codegen2 \n",generatedBoilerPlate)
 }
 //
-//object Poker extends App {
-//  import PostgresSniffer._
-//  val _ = classOf[org.postgresql.Driver]
-//  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-//  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
-//
-//  val metadata = conn.getMetaData
-//
-//
-//  val procedures = results(metadata.getProcedures(null, null, null))(extractProcedures)
-//
-//  println(s"PROCEDURES: ${procedures.size}")
-//
-//  val proceduresWithColumns = procedures.map { procedure =>
-//    procedure -> results(metadata.getProcedureColumns(null, null, procedure.name, null))(extractProcedureColumns)
-//  }
-//
-//  proceduresWithColumns.foreach { case (procedure, columns) =>
-//    println(s"Procedure: ${procedure.name}")
-//    columns.foreach { column =>
-//      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType}")
-//    }
-//  }
-//
-//  val functions = results(metadata.getFunctions(null, null, null))(extractFunctions)
-//
-//  println(s"FUNCTIONS: ${functions.size}")
-//
-//  val functionsWithColumns = functions.filter(_.name.contentEquals("user_extended_info")).map { function =>
-//    function -> results(metadata.getFunctionColumns(null, null, function.name, null))(extractFunctionColumns)
-//  }
-//
-//  functionsWithColumns.foreach { case (procedure, columns) =>
-//    println(s"Function: ${procedure.name}")
-//    columns.foreach { column =>
-//      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType} -> ${column.typeName}")
-//    }
-//  }
-//
-//}
+object Poker extends App {
+  import PostgresSniffer._
+  val _ = classOf[org.postgresql.Driver]
+  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
+  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+
+  val metadata = conn.getMetaData
+
+
+  val procedures = results(metadata.getProcedures(null, null, null))(extractProcedures)
+
+  println(s"PROCEDURES: ${procedures.size}")
+
+  val proceduresWithColumns = procedures.map { procedure =>
+    procedure -> results(metadata.getProcedureColumns(null, null, procedure.name, null))(extractProcedureColumns)
+  }
+
+  proceduresWithColumns.foreach { case (procedure, columns) =>
+    println(s"Procedure: ${procedure.name}")
+    columns.foreach { column =>
+      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType}")
+    }
+  }
+
+  val functions = results(metadata.getFunctions(null, null, null))(extractFunctions)
+
+  println(s"FUNCTIONS: ${functions.size}")
+
+  val functionsWithColumns = functions.filter(_.name.contentEquals("user_extended_info")).map { function =>
+    function -> results(metadata.getFunctionColumns(null, null, function.name, null))(extractFunctionColumns)
+  }
+
+  functionsWithColumns.foreach { case (procedure, columns) =>
+    println(s"Function: ${procedure.name}")
+    columns.foreach { column =>
+      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType} -> ${column.typeName}")
+    }
+  }
+
+}
 

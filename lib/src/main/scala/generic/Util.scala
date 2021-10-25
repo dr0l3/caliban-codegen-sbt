@@ -8,7 +8,7 @@ import caliban.parsing.adt.{Directive, Type}
 import caliban.schema.{Operation, PureStep, Schema, Step, Types}
 import caliban.schema.Step.{MetadataFunctionStep, ObjectStep, QueryStep}
 import codegen.{ArrayPath, ArrayPathWrapper, FieldType, JsonPathPart, ObejctPathWrapper, ObjectExtension, ObjectExtensionField, ObjectPath, PathWrapper, Table}
-import codegen.Util.{argToWhereClause, extendType, toIntermediate, toIntermediateFromReprQuery, toQueryWithJson}
+import codegen.Util.{argToWhereClause, extendType, extractUnwrappedTypename, toIntermediate, toIntermediateFromReprQuery, toQueryWithJson}
 import io.circe.{Decoder, Encoder, Json, JsonObject}
 import io.circe.generic.auto._
 import io.circe.optics.JsonPath.root
@@ -42,7 +42,12 @@ trait DeleteInput {
 }
 
 object Util {
-  case class ExtensionPosition(objectName: String, fieldName: String, requirements: List[String] = Nil)
+  case class ExtensionPosition(objectName: String, fieldName: String, requirements: List[String] = Nil){
+    def matchesField(field: Field): Boolean = {
+      extractUnwrappedTypename(field.fieldType).contentEquals(objectName) &&
+        field.name.contentEquals(fieldName)
+    }
+  }
   type ExtensionLogicMap = List[(ExtensionPosition,Field => JsonObject => ZIO[Any,Throwable,JsonObject])]
   type AppliedExtensionLogicMap = List[(ExtensionPosition,JsonObject => ZIO[Any,Throwable,JsonObject])]
 
@@ -650,12 +655,14 @@ object Util {
   }.flatten.tapError(e => ZIO(e.printStackTrace()))))
 
   def genericQueryHandler[R](tables: List[Table], extensions: ExtensionLogicMap, connection: Connection)(field: Field): Step[R] = QueryStep(ZQuery.fromEffect(ZIO{
+    val start = System.nanoTime()
     // We have created an intermediate that has filtered out all the fields that have @requires
     val intermediate = toIntermediate(field, tables, "root", extensions.map(_._1))
 
     val condition = field.arguments.map { case (k, v) => argToWhereClause(k, v) }.mkString(" AND ")
     val query = toQueryWithJson(intermediate, "root", Option(condition))
 
+    printTime(start, "QUery compilation")
     val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {case (path, tpe) => path -> tpe}
     val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
 
@@ -675,15 +682,20 @@ object Util {
 
     for {
       preparedStatement <- ZIO(connection.prepareStatement(query))
+      _ = printTime(start, "Prepared statemnt")
       resultSet <-ZIO(preparedStatement.executeQuery())
+      _ = printTime(start, "Query executuion")
       resultString <- ZIO{
         resultSet.next()
         resultSet.getString("root")
       }
       resultAsJson <- ZIO.fromEither(io.circe.parser.parse(resultString))
+      _ = printTime(start, "Parsed result")
       resultWithExtensions <- applyExtensions2(field,extensions.map{case (k,v) => k -> v.apply(field)}, resultAsJson, false)
+      _ = printTime(start, "Extensions")
       resultWithTypeNames = typeNameInsertions.foldLeft(resultWithExtensions)((acc, next) => next(acc))
       resultStripped = stripUnwantedStuff(resultWithTypeNames, field)
+      _ = printTime(start, "Stripepd")
       resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultStripped))
       debugPrint =
         s"""
@@ -801,8 +813,17 @@ object Util {
        |${field.fields.map(printQuery(_, s"$indent  ")).mkString("")}""".stripMargin
   }
 
+  def printTime(start: Long, message: String): Unit = {
+    import scala.concurrent.duration._
+    val now = System.nanoTime()
+
+    val timeElapsed = ((now - start).nanos).toMillis
+    println(s"$message: TimeElapsedInMS: $timeElapsed")
+  }
+
   def genericEntityHandler[R](extensions: ExtensionLogicMap, tables: List[Table], conditionsHandlers: Map[String,ObjectValue => String], connection: Connection)(value: InputValue): ZQuery[R, CalibanError, Step[R]] = {
     ZQuery.succeed(Step.MetadataFunctionStep(field => QueryStep(ZQuery.fromEffect(ZIO{
+      val start = System.nanoTime()
       // Convert to intermediate Representation
       val intermediate = toIntermediateFromReprQuery(field, tables, "_entities", extensions.map(_._1))
       // Extract the keys from the arguments
@@ -814,6 +835,7 @@ object Util {
       }
       // Convert to query
       val query = toQueryWithJson(intermediate, "root", Option(condition))
+      printTime(start, "Query Compilation")
       println(query)
 
 
@@ -840,17 +862,22 @@ object Util {
 
       for {
         preparedStatement <- ZIO(connection.prepareStatement(query))
+        _ = printTime(start, "Prepared statemetn")
         resultSet <-ZIO(preparedStatement.executeQuery())
+        _ = printTime(start, "Quuery execution")
         resultString <- ZIO{
           resultSet.next()
           resultSet.getString("root")
         }
         resultAsJson <- ZIO.fromEither(io.circe.parser.parse(resultString))
+        _ = printTime(start, "Result parting")
         resultWithExtensions <- applyExtensions2(field,extensions.map{case (k,v) => k -> v.apply(field)}, resultAsJson, true)
+        _ = printTime(start, "EXtensions")
         resultWithTypeNames = typeNameInsertions.foldLeft(resultWithExtensions)((acc, next) => next(acc))
         // Entity queries always return non null list of non null
         whatever = field.copy(fieldType = field.fieldType.ofType.flatMap(_.ofType).getOrElse(throw new RuntimeException("Entity resolver query does not have inner type of inner type: Should never happen")))
         resultStripped = stripUnwantedStuff(resultWithTypeNames, whatever)
+        _ = printTime(start, "Stripping")
         resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultStripped))
         debugPrint =
           s"""
