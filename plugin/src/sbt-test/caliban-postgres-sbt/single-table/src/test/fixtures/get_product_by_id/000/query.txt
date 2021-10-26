@@ -1,0 +1,8 @@
+{
+ get_product_by_id(upc: "1") {
+  upc
+  name
+  price
+  weight
+ }
+}

@@ -1,6 +1,6 @@
 
 
-version := "0.2"
+version := "0.1-0-SNAPSHOT"
 
 
 
@@ -74,7 +74,19 @@ lazy val plugin = project.in(file("plugin"))
     scriptedLaunchOpts := { scriptedLaunchOpts.value ++
       Seq("-Xmx1024M", "-Dplugin.version=" + version.value)
     },
-    scriptedBufferLog := false
-
+    scriptedBufferLog := false,
+    version:= "0.1.0-SNAPSHOT"
   )
   .dependsOn(lib)
+
+lazy val testUtil = project.in(file("test-util"))
+  .settings(
+    organization := "droletours",
+    name:= "test-util",
+    libraryDependencies += "com.opentable.components" % "otj-pg-embedded" % "0.13.4",
+    libraryDependencies += "org.scalatest" %% "scalatest" % "3.2.10",
+    libraryDependencies += "com.github.ghostdogpr" %% "caliban" % "1.2.0",
+    libraryDependencies += "io.circe" %% "circe-core" % "0.14.1",
+    libraryDependencies += "io.circe" %% "circe-parser" % "0.14.1",
+    crossScalaVersions := List("2.12.12", "2.13.6")
+  )

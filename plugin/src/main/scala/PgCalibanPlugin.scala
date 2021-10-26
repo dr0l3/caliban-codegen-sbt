@@ -7,7 +7,47 @@ import java.sql.DriverManager
 import codegen._
 import zio.{Schedule, ZIO, duration}
 
+import java.net.ServerSocket
 import java.util.concurrent.TimeUnit
+import scala.sys.process.Process
+
+object Util {
+  def randomPort(): Int = {
+    val socket = new ServerSocket(0)
+    socket.setReuseAddress(true)
+    val port = socket.getLocalPort
+    try {
+      socket.close()
+    } finally {
+      socket.close()
+    }
+    port
+  }
+}
+
+object PgCalibanTestPlugin extends AutoPlugin {
+  object autoImport {
+    lazy val pgCalibanTestPort = settingKey[Int]("The port to use for the test run")
+    lazy val pgCalibanStartDatabase = taskKey[Unit]("Start a test database")
+    lazy val pgCalibanShutDownDatabase = taskKey[Unit]("Shut down the database")
+  }
+
+  import autoImport._
+
+  override lazy val projectSettings = Seq(
+    pgCalibanTestPort := Util.randomPort(),
+    pgCalibanStartDatabase := {
+      Process(s"""docker-compose -f ./docker/docker-compose.yml build""",new java.io.File("."), extraEnv = "POSTGRES_PORT"-> pgCalibanTestPort.value.toString).!
+      Process(s"""docker-compose -f ./docker/docker-compose.yml up -d""",new java.io.File("."), extraEnv = "POSTGRES_PORT"-> pgCalibanTestPort.value.toString).!
+    },
+    pgCalibanShutDownDatabase := {
+      Process(s"""docker-compose -f ./docker/docker-compose.yml down -v""",new java.io.File("."), extraEnv = "POSTGRES_PORT"-> "0").!
+    },
+    commands += Command.command("execute-sbt-test"){ state =>
+      "pgCalibanStartDatabase":: "pgCalibanGenerate" :: "compile" :: "test" :: "pgCalibanShutDownDatabase" :: state
+    }
+  )
+}
 
 object PgCalibanPlugin extends AutoPlugin {
   object autoImport {
@@ -25,11 +65,9 @@ object PgCalibanPlugin extends AutoPlugin {
       CrossVersion.partialVersion(scalaVersion.value) match {
         case Some((2, n)) if n == 12 => List(
           "com.github.ghostdogpr" %% "caliban" % "1.1.1+59-f6079748+20211017-1605-SNAPSHOT",
-//          "com.github.ghostdogpr" %% "caliban-federation" % "1.1.1+59-f6079748+20211017-1605-SNAPSHOT",
         )
         case Some((2, n)) if n == 13 => List(
           "com.github.ghostdogpr" %% "caliban" % "1.1.1+59-f6079748+20211017-1606-SNAPSHOT",
-//          "com.github.ghostdogpr" %% "caliban-federation" % "1.1.1+59-f6079748+20211017-1606-SNAPSHOT",
         )
         case _ => Nil
       }

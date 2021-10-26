@@ -5,4 +5,3 @@ sys.props.get("plugin.version") match {
 }
 
 //addSbtPlugin("droletours" % "caliban-postgres-sbt" % "0.1.0-SNAPSHOT" changing())
-//addSbtPlugin("com.tapad" % "sbt-docker-compose" % "1.0.35")

@@ -1,0 +1,8 @@
+{
+  "get_product_by_id": {
+    "name": "Table",
+    "upc": "1",
+    "weight": 100,
+    "price": 899
+  }
+}
