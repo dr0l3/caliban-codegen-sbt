@@ -48,7 +48,10 @@ object TestUtil {
       initializeDatabase(conn)
       val api = apiFactory(conn)
 
+
       val testCaseName = testCaseDir.getName
+      println(s"--------$testCaseName")
+      println(api.render)
       val runs = testCaseDir.listFiles().filter(_.isDirectory).sortBy(_.getName).map { testOp =>
         val query = scala.reflect.io.File(s"${testOp.getAbsolutePath}/query.txt").slurp()
         val variables = scala.reflect.io.File(s"${testOp.getAbsolutePath}/variables.json").slurp()

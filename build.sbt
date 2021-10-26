@@ -78,6 +78,7 @@ lazy val plugin = project.in(file("plugin"))
     version:= "0.1.0-SNAPSHOT"
   )
   .dependsOn(lib)
+  .dependsOn(testUtil)
 
 lazy val testUtil = project.in(file("test-util"))
   .settings(

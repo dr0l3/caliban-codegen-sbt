@@ -35,13 +35,17 @@ object PgCalibanTestPlugin extends AutoPlugin {
   import autoImport._
 
   override lazy val projectSettings = Seq(
+
     pgCalibanTestPort := Util.randomPort(),
     pgCalibanStartDatabase := {
-      Process(s"""docker-compose -f ./docker/docker-compose.yml build""",new java.io.File("."), extraEnv = "POSTGRES_PORT"-> pgCalibanTestPort.value.toString).!
-      Process(s"""docker-compose -f ./docker/docker-compose.yml up -d""",new java.io.File("."), extraEnv = "POSTGRES_PORT"-> pgCalibanTestPort.value.toString).!
+      val extraEnvs = List("POSTGRES_PORT"-> pgCalibanTestPort.value.toString, "TEST_NAME" -> name.value)
+      Process(s"""docker-compose -f ./docker/docker-compose.yml down -v""",new java.io.File("."), extraEnv = extraEnvs:_*).!
+      Process(s"""docker-compose -f ./docker/docker-compose.yml build --no-cache""",new java.io.File("."), extraEnv = extraEnvs:_*).!
+      Process(s"""docker-compose -f ./docker/docker-compose.yml up -d""",new java.io.File("."), extraEnv = extraEnvs:_*).!
     },
     pgCalibanShutDownDatabase := {
-      Process(s"""docker-compose -f ./docker/docker-compose.yml down -v""",new java.io.File("."), extraEnv = "POSTGRES_PORT"-> "0").!
+      val extraEnvs = List("POSTGRES_PORT"-> pgCalibanTestPort.value.toString, "TEST_NAME" -> name.value)
+      Process(s"""docker-compose -f ./docker/docker-compose.yml down -v""",new java.io.File("."), extraEnv = extraEnvs:_*).!
     },
     commands += Command.command("execute-sbt-test"){ state =>
       "pgCalibanStartDatabase":: "pgCalibanGenerate" :: "compile" :: "test" :: "pgCalibanShutDownDatabase" :: state
@@ -55,7 +59,7 @@ object PgCalibanPlugin extends AutoPlugin {
     lazy val pgCalibanPostgresConnectionUrl = settingKey[String]("The connection url to postgres format is jdbc:postgresql://0.0.0.0:5438/product")
     lazy val pgCalibanPostgresUser = settingKey[String]("The user to connect with")
     lazy val pgCalibanPostgresPassword = settingKey[String]("The password to use")
-    lazy val pgCalibanGenerate = taskKey[File]("generate the code")
+    lazy val pgCalibanGenerate = taskKey[Seq[File]]("generate the code")
   }
 
   import autoImport._
@@ -123,8 +127,9 @@ object PgCalibanPlugin extends AutoPlugin {
       IO.write(outputFile,  "package generated" ++ generatedBoilerPlate)
 
       println("WROTE TO FILE")
-      outputFile
-    }
+      List(outputFile)
+    },
+    Compile / sourceGenerators += pgCalibanGenerate
   )
 
 }

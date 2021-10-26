@@ -783,14 +783,22 @@ object Util {
         json.asObject match {
           case Some(value) =>
             val requestedFieldsOnThisLevel = field.fields
-            value.keys.map(key => key -> requestedFieldsOnThisLevel.find(_.name.contentEquals(key))).foldLeft(value) { case (json, (key, fieldForKey)) =>
-              fieldForKey match {
-                case Some(recursiveField) =>
-                  val recursive = JsonObject(key -> stripUnwantedStuff(json(key).get, recursiveField))
-                  json.deepMerge(recursive)
+            value.keys
+              .map(key => key -> requestedFieldsOnThisLevel.find(_.name.contentEquals(key)))
+              .foldLeft(value) { case (json, (key, fieldForKey)) =>
+                fieldForKey match {
+                  case Some(recursiveField) =>
+                    val strippedField = stripUnwantedStuff(json(key).get, recursiveField)
+                    val after = json.remove(key).add(key, strippedField)
+                    println(s"KEEPING $key and recursing. AFTER: $after. Before ${json(key).get}. StripptedField: ${strippedField}")
+                    after
 
-                case None => json.remove(key)
-              }
+                  case None =>
+
+                    val after = json.remove(key)
+                    println(s"REMOVING $key from $json AFTER: ${after}")
+                    after
+                }
             }.asJson
 
           case None => json

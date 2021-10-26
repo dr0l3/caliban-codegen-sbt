@@ -1,0 +1,8 @@
+{
+  "get_product_by_id": {
+    "name": "Couch",
+    "upc": "2",
+    "weight": 1000,
+    "price": 1299
+  }
+}

@@ -1292,15 +1292,19 @@ object PostgresSniffer {
     }
   }
 
-  def usedTypes(tpe: ScalaType): List[String] = {
+  def usedTypes(tpe: ScalaType, acc: List[String]): List[String] = {
     tpe match {
-      case baseType: BaseType => List(baseType.name)
+      case baseType: BaseType => acc ++  List(baseType.name)
       case containerType: ContainerType => containerType match {
-        case ListType(elementType) => usedTypes(elementType)
-        case OptionType(elementType) => usedTypes(elementType)
+        case ListType(elementType) => usedTypes(elementType, acc)
+        case OptionType(elementType) => usedTypes(elementType, acc)
       }
       case CaseClassType(name, fields, isBaseTableClass, isInsertForTable, isUpdateForTable, isDeleteForTable, isFederationArg, externalKeys) =>
-        fields.flatMap(field =>usedTypes(field.scalaType.strict()))
+        if(acc.contains(name)) {
+          acc
+        } else {
+          fields.flatMap(field =>usedTypes(field.scalaType.strict(), acc ++ List(name)))
+        }
     }
   }
 
@@ -1351,7 +1355,7 @@ object PostgresSniffer {
       s"""@GQLDirective(Extend) @GQLDirective(Key(${externalEntity.keys.mkString(" ")}))case class ${externalEntity.name}(${fields.mkString(",")})"""
     }
 
-    val reachableTypenames = apis.map(api => api.caseClass).flatMap(usedTypes(_))
+    val reachableTypenames = apis.map(api => api.caseClass).flatMap(usedTypes(_, Nil))
     val unreacheableTypes = externalEntities
       .filterNot { externalEntity => reachableTypenames.exists(_.contentEquals(externalEntity.name))}
 
