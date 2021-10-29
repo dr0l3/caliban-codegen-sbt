@@ -8,7 +8,7 @@ import caliban.parsing.adt.{Directive, Type}
 import caliban.schema.{Operation, PureStep, Schema, Step, Types}
 import caliban.schema.Step.{MetadataFunctionStep, ObjectStep, QueryStep}
 import codegen.{ArrayPath, ArrayPathWrapper, FieldType, JsonPathPart, ObejctPathWrapper, ObjectExtension, ObjectExtensionField, ObjectPath, PathWrapper, Table}
-import codegen.Util.{argToWhereClause, extendType, extractUnwrappedTypename, toIntermediate, toIntermediateFromReprQuery, toQueryWithJson}
+import codegen.Util.{argToWhereClause, extendType, extractUnwrappedTypename, intermdiateV2ToSQL, toIntermediate, toIntermediateFromReprQuery, toIntermediateV2, toQueryWithJson}
 import io.circe.{Decoder, Encoder, Json, JsonObject}
 import io.circe.generic.auto._
 import io.circe.optics.JsonPath.root
@@ -43,8 +43,8 @@ trait DeleteInput {
 
 object Util {
   case class ExtensionPosition(objectName: String, fieldName: String, requirements: List[String] = Nil){
-    def matchesField(field: Field): Boolean = {
-      extractUnwrappedTypename(field.fieldType).contentEquals(objectName) &&
+    def matchesField(field: Field, tableName: String): Boolean = {
+      tableName.contentEquals(objectName) &&
         field.name.contentEquals(fieldName)
     }
   }
@@ -657,12 +657,13 @@ object Util {
   def genericQueryHandler[R](tables: List[Table], extensions: ExtensionLogicMap, connection: Connection)(field: Field): Step[R] = QueryStep(ZQuery.fromEffect(ZIO{
     val start = System.nanoTime()
     // We have created an intermediate that has filtered out all the fields that have @requires
-    val intermediate = toIntermediate(field, tables, "root", extensions.map(_._1))
+    val intermediate = toIntermediateV2(field, tables, "root", extensions.map(_._1))
 
     val condition = field.arguments.map { case (k, v) => argToWhereClause(k, v) }.mkString(" AND ")
-    val query = toQueryWithJson(intermediate, "root", Option(condition))
+    val query = intermdiateV2ToSQL(intermediate, "root", Option(condition))
 
     printTime(start, "QUery compilation")
+    println(query)
     val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {case (path, tpe) => path -> tpe}
     val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
 
@@ -748,6 +749,9 @@ object Util {
     }
   }
 
+  // TODO: Rework this
+  // Concept is flawed. We compute a typename from the field. This doesn't work with union types.
+  // Either way it would be easier to just walk the resulting json rather than constructing elobarate methods
   def constructTypenameInserters(coordinates: List[(List[JsonPathPart], String)]): List[Json => Json] = {
     coordinates.map{ case (path, tpeName) =>
       path.foldLeft[PathWrapper](ObejctPathWrapper(root)) { (acc, next) =>
@@ -762,8 +766,8 @@ object Util {
           }
         }
       } match {
-        case ObejctPathWrapper(path) => path.obj.modify(obj => obj.add("__typename", Json.fromString(tpeName)))
-        case ArrayPathWrapper(path) =>path.obj.modify(obj => obj.add("__typename", Json.fromString(tpeName)))
+        case ObejctPathWrapper(path) => path.obj.modify(obj => if(obj.apply("__typename").nonEmpty) obj else obj.add("__typename", Json.fromString(tpeName)))
+        case ArrayPathWrapper(path) =>path.obj.modify(obj => if(obj.apply("__typename").nonEmpty) obj else obj.add("__typename", Json.fromString(tpeName)))
       }
     }
   }
@@ -784,7 +788,7 @@ object Util {
           case Some(value) =>
             val requestedFieldsOnThisLevel = field.fields
             value.keys
-              .map(key => key -> requestedFieldsOnThisLevel.find(_.name.contentEquals(key)))
+              .map(key => key -> requestedFieldsOnThisLevel.find(field => field.alias.getOrElse(field.name).contentEquals(key)))
               .foldLeft(value) { case (json, (key, fieldForKey)) =>
                 fieldForKey match {
                   case Some(recursiveField) =>
@@ -804,7 +808,33 @@ object Util {
           case None => json
         }
       case __TypeKind.INTERFACE => json
-      case __TypeKind.UNION => json
+      case __TypeKind.UNION =>
+        json.asObject match {
+          case Some(value) =>
+            val typeName = value.apply("__typename").get.asString.get // TODO: FIX
+            val requestedFieldsOnThisLevel = field.fields.filter(field => field.parentType.flatMap(_.name).exists(_.contentEquals(typeName)) || field.name.contentEquals("__typename")) // TODO: FIX
+            println(s"REQUESTED FIELDS ${field.fields.map(_.name)}")
+            println(s"REQUESTED FOR OBJET $typeName:  ${requestedFieldsOnThisLevel.map(_.name)}")
+            value.keys
+              .map(key => key -> requestedFieldsOnThisLevel.find(field => field.alias.getOrElse(field.name).contentEquals(key)))
+              .foldLeft(value) { case (json, (key, fieldForKey)) =>
+                fieldForKey match {
+                  case Some(recursiveField) =>
+                    val strippedField = stripUnwantedStuff(json(key).get, recursiveField) //TODO: FIX
+                    val after = json.remove(key).add(key, strippedField)
+                    println(s"KEEPING $key and recursing. AFTER: $after. Before ${json(key).get}. StripptedField: ${strippedField}")
+                    after
+
+                  case None =>
+
+                    val after = json.remove(key)
+                    println(s"REMOVING $key from $json AFTER: ${after}")
+                    after
+                }
+              }.asJson
+
+          case None => json
+        }
       case __TypeKind.ENUM => json
       case __TypeKind.INPUT_OBJECT => json
       case __TypeKind.LIST =>
@@ -829,11 +859,18 @@ object Util {
     println(s"$message: TimeElapsedInMS: $timeElapsed")
   }
 
+  def printType(tpe: __Type): String = {
+    tpe.ofType match {
+      case Some(inner) => s"""${tpe.name.getOrElse("THISMAKESLITTLESENSE")} of ${printType(inner)}"""
+      case None => tpe.name.getOrElse("THISMAKESNOSENSE")
+    }
+  }
+
   def genericEntityHandler[R](extensions: ExtensionLogicMap, tables: List[Table], conditionsHandlers: Map[String,ObjectValue => String], connection: Connection)(value: InputValue): ZQuery[R, CalibanError, Step[R]] = {
     ZQuery.succeed(Step.MetadataFunctionStep(field => QueryStep(ZQuery.fromEffect(ZIO{
       val start = System.nanoTime()
       // Convert to intermediate Representation
-      val intermediate = toIntermediateFromReprQuery(field, tables, "_entities", extensions.map(_._1))
+      val intermediate = toIntermediateV2(field, tables, "_entities", extensions.map(_._1), rootLevelOfEntityResolver = true)
       // Extract the keys from the arguments
       val condition = value match {
         case o @ ObjectValue(fields) =>
@@ -842,7 +879,7 @@ object Util {
         case _ => throw new RuntimeException("should never happen")
       }
       // Convert to query
-      val query = toQueryWithJson(intermediate, "root", Option(condition))
+      val query = intermdiateV2ToSQL(intermediate, "root", Option(condition))
       printTime(start, "Query Compilation")
       println(query)
 
@@ -857,7 +894,10 @@ object Util {
       // Caliban federation is weird
       val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map { case (path, tpe) =>
         println(s"PATH: $path")
-        path.tail -> tpe
+        path match {
+          case Nil => path -> tpe
+          case ::(_, tl) => tl -> tpe
+        }
       }
       val cooridnatesDebug = coordinatesForTypenameQueries.map { case (path, typename) => s"${path} -> $typename"}.mkString("\n")
 
@@ -883,7 +923,9 @@ object Util {
         _ = printTime(start, "EXtensions")
         resultWithTypeNames = typeNameInsertions.foldLeft(resultWithExtensions)((acc, next) => next(acc))
         // Entity queries always return non null list of non null
+        tpeBefore = printType(field.fieldType)
         whatever = field.copy(fieldType = field.fieldType.ofType.flatMap(_.ofType).getOrElse(throw new RuntimeException("Entity resolver query does not have inner type of inner type: Should never happen")))
+        tpeAfter = printType(whatever.fieldType)
         resultStripped = stripUnwantedStuff(resultWithTypeNames, whatever)
         _ = printTime(start, "Stripping")
         resultAsResponseValue <- ZIO.fromEither(ResponseValue.circeDecoder.decodeJson(resultStripped))
@@ -902,6 +944,10 @@ object Util {
              |$resultWithTypeNames
              |ResultStripped
              |$resultStripped
+             |TPEBEFORE
+             |$tpeBefore
+             |TPEAFTER
+             |$tpeAfter
              |--------------------------------------
              |""".stripMargin
         _ <- ZIO(println(debugPrint))

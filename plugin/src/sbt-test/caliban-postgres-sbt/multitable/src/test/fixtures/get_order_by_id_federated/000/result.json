@@ -1,0 +1,30 @@
+
+{
+  "_entities": [
+    {
+      "lineitems": [
+        {
+          "product": {
+            "name": "Table",
+            "upc": "1",
+            "weight": 100,
+            "price": 899
+          },
+          "amount": 1
+        },
+        {
+          "product": {
+            "name": "Couch",
+            "upc": "2",
+            "weight": 1000,
+            "price": 1299
+          },
+          "amount": 3
+        }
+      ],
+      "created_at": "2021-10-26T13:03:07+02:00",
+      "buyer": "Rune",
+      "__typename": "orders"
+    }
+  ]
+}

@@ -67,16 +67,37 @@ case class Intermediate(cols: List[String], from: IntermediateFrom, field: CFiel
 
 
 // A table will at least be an object so no need to support scalars
-sealed trait SQLResponseType
-case object ObjectResponse extends SQLResponseType
-case object ListResponse extends SQLResponseType
-case class Optional(inner: SQLResponseType) extends SQLResponseType
+sealed trait SQLResponseType {
+  def wrapInErrorHandling(fieldNameOfObject: String, tableSql: String): String
+}
+case object ObjectResponse extends SQLResponseType {
+  override def wrapInErrorHandling(fieldNameOfObject: String, tableSql: String): String =
+    s"""
+       |select coalesce((json_agg("$fieldNameOfObject") -> 0), 'null') as "$fieldNameOfObject"
+       |from (
+       |  $tableSql
+       |) as "root"
+       |""".stripMargin
+}
+case object ListResponse extends SQLResponseType {
+  override def wrapInErrorHandling(fieldNameOfObject: String, tableSql: String): String =
+    s"""
+       |select coalesce(json_agg("$fieldNameOfObject"), '[]') as "$fieldNameOfObject"
+       |from (
+       |  $tableSql
+       |) as "root"
+       |""".stripMargin
+}
 
 case class IntermediateColumn(nameInTable: String, outputName: String) // What about function columns?
 case class IntermediateJoinV2(leftColName: String, rightColName: String, right: IntermediateV2, name: String)
 
 case class IntermediateFromV2(tableName: String, joins: List[IntermediateJoinV2]) // What about functions?
-sealed trait IntermediateV2
+sealed trait IntermediateV2 {
+  def from: IntermediateFromV2
+  def cols: List[IntermediateColumn]
+  def responseType: SQLResponseType
+}
 case class IntermediateV2Regular(
                                   cols: List[IntermediateColumn],
                                   from: IntermediateFromV2,
@@ -91,7 +112,9 @@ case class IntermediateV2Union(
                                 responseType: SQLResponseType,
                                 condition: Option[String],
                                 ordering: Option[String]
-                              ) extends IntermediateV2
+                              ) extends IntermediateV2 {
+  override def cols: List[IntermediateColumn] = Nil
+}
 
 case class IntermediateUnion(discriminatorColumn: String, columnsByDiscriminatorValue: Map[String, List[String]]) {
   def toSQL(field: CField) : String =  {
@@ -683,15 +706,20 @@ object Util {
 
   def findTableFromFieldType(fieldType: __Type, tables: List[Table]): Table = {
     val unwrappedTypename = extractUnwrappedTypename(fieldType)
-    tables.find(_.matchesName(unwrappedTypename)).getOrElse(throw new RuntimeException("Unable to find table from type"))
+    tables.find(_.matchesName(unwrappedTypename)).getOrElse(throw new RuntimeException(s"Unable to find table $unwrappedTypename from type"))
+  }
+
+  def findTableFromFieldTypeReprQuery(field: CField, tables: List[Table]): Table = {
+    val tableName = field.fields.headOption.flatMap(_.parentType).flatMap(_.name).getOrElse(throw new RuntimeException("Unable to find table name for _entities request"))
+    tables.find(_.matchesName(tableName)).getOrElse(throw new RuntimeException(s"Unable to find table $tableName from type"))
   }
 
   def fieldToSQLResponseType(fieldType: __Type, nullable: Boolean): SQLResponseType = {
     fieldType.kind match {
       case __TypeKind.SCALAR => ???
-      case __TypeKind.OBJECT  => if(nullable) ObjectResponse else Optional(ObjectResponse)
-      case __TypeKind.INTERFACE => if(nullable) ObjectResponse else Optional(ObjectResponse)
-      case __TypeKind.UNION => if(nullable) ObjectResponse else Optional(ObjectResponse)
+      case __TypeKind.OBJECT  => ObjectResponse
+      case __TypeKind.INTERFACE => ObjectResponse
+      case __TypeKind.UNION => ObjectResponse
       case __TypeKind.ENUM => ???
       case __TypeKind.INPUT_OBJECT => ???
       case __TypeKind.LIST => ListResponse
@@ -709,33 +737,39 @@ object Util {
     None
   }
 
-  def toIntermediateV2(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition]): IntermediateV2 = {
+  def matchesTypenameQuery(field: CField): Boolean = {
+    field.name.contentEquals("__typename")
+  }
+
+  def toIntermediateV2(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition], rootLevelOfEntityResolver: Boolean = false): IntermediateV2 = {
     // Find the table
-    val table = findTableFromFieldType(field.fieldType, tables)
-    // Extension fields
-    val (extensionFields, sqlFields) = field.fields.partition(f => extensions.exists(_.matchesField(f)))
+    val table =
+      if(rootLevelOfEntityResolver) findTableFromFieldTypeReprQuery(field, tables)
+      else findTableFromFieldType(field.fieldType, tables)
+    // Remove extension fields and __typename fields
+    val sqlFields = field.fields
+      .filterNot(matchesTypenameQuery)
+      .filterNot(field => extensions.exists(_.matchesField(field, table.name)))
     // Find the columns we fetch from this table
     // Find the recursive cases
-    val (tableFields, recursiveFields) = sqlFields.partition(f => (table.primaryKeys++table.otherColumns).exists(_.matchesName(f.name)))
+    val (tableFields, recursiveFields) = sqlFields
+      .partition(field => (table.primaryKeys++table.otherColumns).exists(_.matchesName(field.name)))
 
     // Recurse on the recursive cases (joins)
     val joins = recursiveFields
-      .map(field => toIntermediateV2(field, tables, s"${layerName}.${field.name}", extensions))
-      .map { otherTable =>
-        val otherTableName = otherTable match {
-          case IntermediateV2Regular(cols, from, responseType, condition, ordering) => from.tableName
-          case IntermediateV2Union(discriminatorFieldName, discriminatorMapping, from, responseType, condition, ordering) => from.tableName
-        }
+      .map(field => (toIntermediateV2(field, tables, s"${layerName}.${field.name}", extensions), field))
+      .map { case (otherTable, field) =>
+        val otherTableName = otherTable.from.tableName
 
         // Find the link between the tables, it has to exist
         // First check if this table is the primary key table
         // Then check if this table is the foreign key table
         table.relationships
           .find { relationshipTable => relationshipTable.pkTableName == table.name && relationshipTable.fkTableName == otherTableName }
-          .map(link => IntermediateJoinV2(link.pkColumnName, link.fkColumnName, otherTable, "TODO"))
+          .map(link => IntermediateJoinV2(link.pkColumnName, link.fkColumnName, otherTable, otherTableName))
           .orElse(table.relationships
             .find { relationshipTable => relationshipTable.fkTableName == table.name && relationshipTable.pkTableName == otherTableName}
-            .map(link => IntermediateJoinV2(link.fkColumnName, link.pkColumnName, otherTable, "TODO"))
+            .map(link => IntermediateJoinV2(link.fkColumnName, link.pkColumnName, otherTable, otherTableName))
           )
           .getOrElse(throw new RuntimeException(s"Unable to find link between ${table.name} and ${otherTable} required by ${field}"))
       }
@@ -743,7 +777,8 @@ object Util {
     // Fetch any columns the extensions depend on
     val usedExtensions = extensions.filter(extension => extension.objectName.contentEquals(table.name) && field.fields.exists(_.name.contentEquals(extension.fieldName)))
     val requirementsFromExtensions = usedExtensions.flatMap(_.requirements)
-    val responseType = fieldToSQLResponseType(field.fieldType, nullable = true)
+    // Caliban federation handling is weird
+    val responseType = if(rootLevelOfEntityResolver) ObjectResponse else fieldToSQLResponseType(field.fieldType, nullable = true)
     val ordering = extractOrdering(field)
     val condition = extractCondition(field)
 
@@ -754,6 +789,142 @@ object Util {
 
     IntermediateV2Regular(requirementsColumns ++ tableColumns, IntermediateFromV2(table.name, joins),responseType, condition, ordering)
 
+  }
+
+  def intermdiateV2ToSQL(intermediate: IntermediateV2, fieldNameOfObject: String, additionalCondition: Option[String]): String = {
+    val dataId = s"${fieldNameOfObject}_data"
+
+    val thisTableSQL = intermediate match {
+      case IntermediateV2Regular(cols, from, responseType, condition, ordering) =>
+        /*
+        select "json_spec"
+        from (
+          select "$dataId"."colName" as "outputName",
+          select "$dataId"."colName" as "outputName",
+          select "$dataId"."colName" as "outputName",
+        )
+       */
+        val tableCols = cols.map { col =>
+          s""""$dataId"."${col.nameInTable}" as "${col.outputName}""""
+        }
+
+        val joinCols = intermediate.from.joins.map { join =>
+          val fieldName = join.name
+          s""" "$fieldNameOfObject.$fieldName"."$fieldNameOfObject.$fieldName" as "$fieldName" """
+        } ++ List(s"""'${from.tableName}' as "__typename"""")
+
+        val effectiveCondition = (additionalCondition.toList ++ condition.toList) match {
+          case Nil => ""
+          case list => list.mkString(" where ", " AND " , "")
+        }
+
+          s"""
+             |select row_to_json(
+             |    (
+             |      select "json_spec"
+             |      from (
+             |        select ${(tableCols ++ joinCols).mkString(",")}
+             |      ) as "json_spec"
+             |     )
+             |) as "$fieldNameOfObject"
+             |from (select * from ${from.tableName} $effectiveCondition) as "$dataId"
+             |    """.stripMargin
+      case IntermediateV2Union(discriminatorFieldName, discriminatorMapping, from, responseType, condition, ordering) =>
+        /*
+        select "json_spec"
+        from (
+          select case
+                  when "$dataId"."$discriminatorFieldName" = '$discriminatorMapping[0]'
+                    then json_build_object(
+                      '$discriminatorMapping[0][0]${outputName}', "$dataId"."colName",
+                      '$discriminatorMapping[0][0]${outputName}', "$dataId"."colName"
+                    )
+                  when "$dataId"."$discriminatorFieldName" = '$discriminatorMapping[1]'
+                    then json_build_object(
+                      '$discriminatorMapping[0][0]${outputName}', "$dataId"."colName",
+                      '$discriminatorMapping[0][0]${outputName}', "$dataId"."colName"
+                    )
+                  else
+                    json_build_object(
+                      '$discriminatorMapping[0][0]${outputName}', "$dataId"."colName",
+                      '$discriminatorMapping[0][0]${outputName}', "$dataId"."colName"
+                    )
+        )
+       */
+
+        discriminatorMapping.size match {
+          case 0 => responseType match {
+            case ObjectResponse => "select json_agg('null')"
+            case ListResponse => "select json_agg('[]')"
+          }
+          case 1 =>
+            //TODO:
+            "regular table"
+          case _ =>
+            val last = discriminatorMapping.last
+            val nMinusOne = discriminatorMapping.filterNot{case (k,_) => k.contentEquals(last._1)}
+
+            val elseClause  = last._2.map{ col =>
+              s"""'${col.outputName}', "$dataId"."${col.nameInTable}""""
+            }++List(s"""'__typename', '${last._1}'""").mkString(
+              s"""else
+                 |  json_build_object(
+                 |""".stripMargin,
+              ",",
+              ")"
+            )
+
+            val whenClauses = nMinusOne.map { case (discriminatorValue, columns)=>
+              columns.map{ col =>
+                s"""'${col.outputName}', "$dataId"."${col.nameInTable}""""
+              }++List(s"""'__typename', '$discriminatorValue'""").mkString(
+                s"""when "$dataId"."$discriminatorFieldName" = '$discriminatorValue'
+                   |  then json_build_object(
+                   |""".stripMargin,
+                ",",
+                ")"
+              )
+            }
+
+            val subSelect = responseType match {
+              case ObjectResponse => " -> 0"
+              case ListResponse => ""
+            }
+
+            val effectiveCondition = (additionalCondition.toList ++ condition.toList) match {
+              case Nil => ""
+              case list => list.mkString("where ", " AND ", "")
+            }
+
+              s"""
+                 |select json_agg(
+                 |  select "json_spec"."object"
+                 |  from (
+                 |    select case
+                 |      ${whenClauses.mkString("\n")}
+                 |      $elseClause
+                 |      end as "object"
+                 |  ) as "json_spec"
+                 |) $subSelect as $fieldNameOfObject
+                 |from (select * from ${intermediate.from.tableName} $effectiveCondition) as "$dataId"
+                 |""".stripMargin
+
+        }
+    }
+
+    val joins = intermediate.from.joins.map { join =>
+      (
+        intermdiateV2ToSQL(join.right, s"""${fieldNameOfObject}.${join.name}""", Option(s""""$dataId"."${join.leftColName}" = "${join.rightColName}"""")),
+        s"${fieldNameOfObject}.${join.right.from.tableName}"
+      )
+    }
+
+    val thisTableWithJoins = joins
+      .foldLeft(thisTableSQL)((acc, next) => {
+        acc ++ s""" LEFT JOIN LATERAL (${next._1}) as "${next._2}" on true """
+      })
+
+    intermediate.responseType.wrapInErrorHandling(fieldNameOfObject, thisTableWithJoins)
   }
 
   def compileFrom(intermediate: Intermediate, top: Boolean): String = {
@@ -1299,11 +1470,11 @@ object PostgresSniffer {
         case ListType(elementType) => usedTypes(elementType, acc)
         case OptionType(elementType) => usedTypes(elementType, acc)
       }
-      case CaseClassType(name, fields, isBaseTableClass, isInsertForTable, isUpdateForTable, isDeleteForTable, isFederationArg, externalKeys) =>
-        if(acc.contains(name)) {
+      case c: CaseClassType =>
+        if(acc.contains(c.name)) {
           acc
         } else {
-          fields.flatMap(field =>usedTypes(field.scalaType.strict(), acc ++ List(name)))
+          c.fields.flatMap(field =>usedTypes(field.scalaType.strict(), acc ++ List(c.name)))
         }
     }
   }

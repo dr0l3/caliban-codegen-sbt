@@ -1,7 +1,7 @@
 
-
-version := "0.1-0-SNAPSHOT"
-
+inThisBuild {
+  version := "0.2.0-SNAPSHOT"
+}
 
 
 lazy val lib = project.in(file("lib")).settings(
@@ -74,8 +74,7 @@ lazy val plugin = project.in(file("plugin"))
     scriptedLaunchOpts := { scriptedLaunchOpts.value ++
       Seq("-Xmx1024M", "-Dplugin.version=" + version.value)
     },
-    scriptedBufferLog := false,
-    version:= "0.1.0-SNAPSHOT"
+    scriptedBufferLog := false
   )
   .dependsOn(lib)
   .dependsOn(testUtil)

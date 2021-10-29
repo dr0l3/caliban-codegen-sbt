@@ -1,0 +1,18 @@
+{
+  "_entities": [
+    {
+      "__typename" : "product",
+      "name": "Table",
+      "upc": "1",
+      "weight": 100,
+      "price": 899
+    },
+    {
+      "__typename" : "product",
+      "name": "Couch",
+      "upc": "2",
+      "weight": 1000,
+      "price": 1299
+    }
+  ]
+}

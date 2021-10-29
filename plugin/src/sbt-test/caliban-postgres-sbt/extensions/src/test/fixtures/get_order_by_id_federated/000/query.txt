@@ -1,0 +1,19 @@
+query($representations:[_Any!]!){
+    _entities(representations:$representations){
+        ...on orders {
+             __typename
+             buyer
+             created_at
+             lineitems {
+                amount
+                product {
+                   upc
+                   name
+                   price
+                   weight
+                   custom
+                }
+             }
+          }
+    }
+}
