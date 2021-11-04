@@ -142,9 +142,7 @@ case class IntermediateV2Regular(
     cols: List[IntermediateColumn],
     from: IntermediateFromV2,
     responseType: SQLResponseType,
-    condition: Option[String],
     ordering: Option[String],
-    sizing: String, //Limit and optionally offset
     where: List[String],
     pagination: Option[String],
     fieldName: String
@@ -154,9 +152,7 @@ case class IntermediateV2Union(
     discriminatorMapping: Map[String, List[IntermediateColumn]],
     from: IntermediateFromV2,
     responseType: SQLResponseType,
-    condition: Option[String],
     ordering: Option[String],
-    sizing: String, // Limit and optionally offset
     where: List[String],
     pagination: Option[String],
     fieldName: String
@@ -1888,9 +1884,7 @@ object Util {
       requirementsColumns ++ tableColumns,
       IntermediateFromV2(table.name, joins),
       responseType,
-      condition,
       ordering,
-      pagination.getOrElse(""),
       whereClauses ++ whereClauseFromField,
       pagination,
       fieldName
@@ -1899,23 +1893,11 @@ object Util {
 
   def intermdiateV2ToSQL(
       intermediate: IntermediateV2
-//      fieldNameOfObject: String,
-//      additionalCondition: Option[String]
   ): String = {
     val dataId = intermediate.dataId
 
     val thisTableSQL = intermediate match {
-      case IntermediateV2Regular(
-            cols,
-            from,
-            responseType,
-            condition,
-            ordering,
-            sizing,
-            a,
-            b,
-            c
-          ) =>
+      case reg: IntermediateV2Regular =>
         /*
         select "json_spec"
         from (
@@ -1924,14 +1906,14 @@ object Util {
           select "$dataId"."colName" as "outputName",
         )
          */
-        val tableCols = cols.map { col =>
+        val tableCols = reg.cols.map { col =>
           s""""$dataId"."${col.nameInTable}" as "${col.outputName}""""
         }
 
         val joinCols = intermediate.from.joins.map { join =>
           val fieldName = join.name
           s""" "${intermediate.fieldName}.$fieldName"."${intermediate.fieldName}.$fieldName" as "$fieldName" """
-        } ++ List(s"""'${from.tableName}' as "__typename"""")
+        } ++ List(s"""'${reg.from.tableName}' as "__typename"""")
 
         val effectiveCondition =
           intermediate.where.filter(_.nonEmpty) match {
@@ -1950,18 +1932,9 @@ object Util {
              |      ) as "json_spec"
              |     )
              |) as "${intermediate.fieldName}"
-             |from (select * from ${from.tableName} $effectiveCondition ${intermediate.pagination.getOrElse("")}) as "$dataId"
+             |from (select * from ${reg.from.tableName} $effectiveCondition ${intermediate.pagination.getOrElse("")}) as "$dataId"
              |    """.stripMargin
-      case IntermediateV2Union(
-            discriminatorFieldName,
-            discriminatorMapping,
-            from,
-            responseType,
-            condition,
-            ordering,
-            sizing,
-            a,b,c
-          ) =>
+      case union: IntermediateV2Union=>
         /*
         select "json_spec"
         from (
@@ -1984,9 +1957,9 @@ object Util {
         )
          */
 
-        discriminatorMapping.size match {
+        union.discriminatorMapping.size match {
           case 0 =>
-            responseType match {
+            union.responseType match {
               case ObjectResponse => "select json_agg('null')"
               case ListResponse   => "select json_agg('[]')"
             }
@@ -1994,8 +1967,8 @@ object Util {
             //TODO:
             "regular table"
           case _ =>
-            val last = discriminatorMapping.last
-            val nMinusOne = discriminatorMapping.filterNot { case (k, _) =>
+            val last = union.discriminatorMapping.last
+            val nMinusOne = union.discriminatorMapping.filterNot { case (k, _) =>
               k.contentEquals(last._1)
             }
 
@@ -2014,7 +1987,7 @@ object Util {
                 columns.map { col =>
                   s"""'${col.outputName}', "$dataId"."${col.nameInTable}""""
                 } ++ List(s"""'__typename', '$discriminatorValue'""").mkString(
-                  s"""when "$dataId"."$discriminatorFieldName" = '$discriminatorValue'
+                  s"""when "$dataId"."$union.discriminatorFieldName" = '$discriminatorValue'
                    |  then json_build_object(
                    |""".stripMargin,
                   ",",
@@ -2022,13 +1995,13 @@ object Util {
                 )
             }
 
-            val subSelect = responseType match {
+            val subSelect = union.responseType match {
               case ObjectResponse => " -> 0"
               case ListResponse   => ""
             }
 
             val effectiveCondition =
-              (condition.toList.filter(_.nonEmpty)) match {
+              (union.where.toList.filter(_.nonEmpty)) match {
                 case Nil  => ""
                 case list => list.mkString("where ", " AND ", "")
               }
@@ -2043,7 +2016,7 @@ object Util {
                  |      end as "object"
                  |  ) as "json_spec"
                  |) $subSelect as ${intermediate.fieldName}
-                 |from (select * from ${intermediate.from.tableName} $effectiveCondition $sizing) as "$dataId"
+                 |from (select * from ${intermediate.from.tableName} $effectiveCondition ${union.pagination.getOrElse("")}) as "$dataId"
                  |""".stripMargin
 
         }
@@ -2052,11 +2025,7 @@ object Util {
     val joins = intermediate.from.joins.map { join =>
       (
         intermdiateV2ToSQL(
-          join.right,
-//          s"""${intermediate.fieldName}.${join.name}"""
-//          Option(
-//            s""""$dataId"."${join.leftColName}" = "${join.rightColName}""""
-//          )
+          join.right
         ),
         s"${intermediate.fieldName}.${join.right.from.tableName}"
       )
