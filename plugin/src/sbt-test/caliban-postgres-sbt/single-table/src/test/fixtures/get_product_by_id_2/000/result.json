@@ -1,5 +1,5 @@
 {
-  "get_product_by_id": {
+  "getproductById": {
     "name": "Couch",
     "upc": "2",
     "weight": 1000,

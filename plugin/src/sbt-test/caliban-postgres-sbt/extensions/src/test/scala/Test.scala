@@ -1,4 +1,4 @@
-import generated.{API, Extensions,productcustomExtensionArgs}
+import generated.Definitions.{API, Extensions,productcustomExtensionArg}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 
@@ -12,7 +12,7 @@ class Test extends AnyFunSuite with Matchers {
   val _ = classOf[org.postgresql.Driver]
 
   val extensionsImpl = new Extensions {
-    def productcustom(field: Field, args: productcustomExtensionArgs): ZIO[Any,Throwable, Option[String]] = ZIO(Option(s"custom ${args.upc}"))
+    def productcustom(productcustomExtensionArg: productcustomExtensionArg): ZIO[Any,Throwable, Option[String]] = ZIO(Option(s"custom ${productcustomExtensionArg.upc}"))
   }
 
   TestUtil.createTests(new File("src/test/fixtures"), (conn: Connection) => new API(extensionsImpl,conn).createApi()).foreach { case (testRun, testName) =>

@@ -1,4 +1,4 @@
-import generated.{API, Extensions}
+import generated.Definitions.{API, Extensions}
 import runner.DefaultRunner
 import zio._
 

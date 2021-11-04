@@ -4,7 +4,7 @@ query($representations:[_Any!]!){
              __typename
              buyer
              created_at
-             lineitems {
+             lineitems(limit: 25) {
                 amount
                 product {
                    upc

@@ -61,6 +61,7 @@ object TestUtil {
           variablesAsInput <- ZIO.fromEither(readVariables(variables))
           res <- interpreter.execute(query, variables = variablesAsInput)
           parsedResult <- ZIO.fromEither(parser.parse(expectedResult))
+          _ = println(res)
         } yield ResponseValue.circeEncoder.apply(res.data) shouldBe parsedResult
       }
 

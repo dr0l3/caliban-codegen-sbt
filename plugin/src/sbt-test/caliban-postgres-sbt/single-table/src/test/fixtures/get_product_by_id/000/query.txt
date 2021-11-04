@@ -1,5 +1,5 @@
 {
- get_product_by_id(upc: "1") {
+ getproductById(upc: "1") {
   upc
   name
   price

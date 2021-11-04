@@ -1,4 +1,4 @@
-import generated.{API, Extensions,productcustomExtensionArgs}
+import generated.Definitions.{API, Extensions,productcustomExtensionArg}
 import runner.DefaultRunner
 import caliban.execution.Field
 
@@ -13,7 +13,7 @@ object Runner extends App{
   implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
 
   val extensionsImpl = new Extensions {
-    def productcustom(field: Field, args: productcustomExtensionArgs): ZIO[Any,Throwable, Option[String]] = ZIO(Option(s"custom ${args.upc}"))
+    def productcustom(productcustomExtensionArg: productcustomExtensionArg): ZIO[Any,Throwable, Option[String]] = ZIO(Option(s"custom ${productcustomExtensionArg.upc}"))
   }
 
   val api = new API(extensionsImpl, conn).createApi()

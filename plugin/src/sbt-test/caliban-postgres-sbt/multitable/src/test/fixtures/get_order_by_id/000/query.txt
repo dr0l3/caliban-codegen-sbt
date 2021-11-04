@@ -1,8 +1,8 @@
 {
- get_orders_by_id(id: "71a4419d-14ad-44ef-8194-4bece18c116f") {
+ getordersById(id: "71a4419d-14ad-44ef-8194-4bece18c116f") {
     buyer
     created_at
-    lineitems {
+    lineitems(limit: 15) {
        amount
        product {
           upc

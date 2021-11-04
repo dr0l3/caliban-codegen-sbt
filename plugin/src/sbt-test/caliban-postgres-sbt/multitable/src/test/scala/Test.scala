@@ -1,4 +1,4 @@
-import generated.{API, Extensions}
+import generated.Definitions.{API, Extensions}
 import org.scalatest.funsuite.AnyFunSuite
 import org.scalatest.matchers.should.Matchers
 

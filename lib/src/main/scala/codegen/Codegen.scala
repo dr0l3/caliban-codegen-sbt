@@ -1,6 +1,9 @@
 package codegen
 
-import caliban.parsing.adt.Definition.{TypeSystemDefinition, TypeSystemExtension}
+import caliban.parsing.adt.Definition.{
+  TypeSystemDefinition,
+  TypeSystemExtension
+}
 import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition
 import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition.ObjectTypeDefinition
 import caliban.parsing.adt.Definition.TypeSystemExtension.TypeExtension
@@ -8,15 +11,41 @@ import caliban.parsing.adt.{Definition, Directive, Document, Type}
 import caliban._
 import caliban.execution.{Field => CField}
 import caliban.federation.{EntityResolver, federate}
-import caliban.introspection.adt.{__DeprecatedArgs, __Directive, __Field, __Type, __TypeKind}
+import caliban.introspection.adt.{
+  __DeprecatedArgs,
+  __Directive,
+  __Field,
+  __InputValue,
+  __Type,
+  __TypeKind
+}
 import caliban.parsing.{ParsedDocument, Parser, SourceMapper}
 import caliban.schema.Step.{MetadataFunctionStep, ObjectStep, PureStep}
 import caliban.schema.{Operation, RootSchemaBuilder, Schema, Step, Types}
 import caliban.wrappers.Wrapper
 import cats.Applicative
-import codegen.PostgresSniffer.typeMap
-import codegen.Util.{extractTypeName, typeToScalaType, typeTo__Type}
-import generic.Util.{ExtensionPosition, genericQueryHandler}
+import codegen.Util.{extractTypeName, typeToScalaTypeV2}
+import codegen.Version2.{
+  CaseClassType2,
+  ContainerType,
+  Field2,
+  Method2,
+  MethodParam,
+  ObjectField,
+  ScalaInt,
+  ScalaList,
+  ScalaOption,
+  ScalaString,
+  ScalaUUID,
+  createRelationshipFields2,
+  globalTypeMap
+}
+import generic.Util.{ExtensionPosition, genericQueryHandler, printType}
+import io.circe.Decoder
+import zio.NonEmptyChunk
+
+import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
 //import codegen.Runner.api
 import fastparse.parse
 import io.circe.optics.JsonPath.root
@@ -24,6 +53,10 @@ import io.circe.optics.{JsonPath, JsonTraversalPath}
 import io.circe.{Json, JsonObject, parser}
 import zio.query.ZQuery
 import zio.{UIO, ZIO}
+import io.circe.{Decoder, Encoder, Json, JsonObject}
+import io.circe.generic.auto._
+import io.circe.optics.JsonPath.root
+import io.circe.syntax._
 
 import java.sql.{Connection, DriverManager, ResultSet}
 import java.util.UUID
@@ -31,17 +64,17 @@ import scala.collection.mutable
 import scala.io.Source
 import scala.tools.nsc.io.File
 
-
 sealed trait JsonPathPart
 case object ArrayPath extends JsonPathPart
-case class ObjectPath(fieldName: String, typeTest: Option[String]) extends JsonPathPart
+case class ObjectPath(fieldName: String, typeTest: Option[String])
+    extends JsonPathPart
 
-
-case class ObjectExtensionField(fieldName: String, fieldType: ScalaType, requiredFields: List[String], isExternal: Boolean = false)
-case class ObjectExtension(objectName: String, field: ObjectExtensionField)
 case class ExternalField(name: String, tpe: Type, external: Boolean)
-case class ExternalEntity(name: String, fields: List[ExternalField], keys: List[String])
-
+case class ExternalEntity(
+    name: String,
+    fields: List[ExternalField],
+    keys: List[String]
+)
 
 // Wrapper neccesary for fold the fold left to work
 sealed trait PathWrapper
@@ -52,26 +85,15 @@ sealed trait JsonSelection
 case class ObjectFieldSelection(fieldName: String) extends JsonSelection
 case object ArraySelection extends JsonSelection
 
-case class Join(tableName: String, leftCol: String, rightCol: String)
-
-
-case class From(tableName: String, join: List[Join])
-
-case class SQLQuery(cols: List[String], from: From)
-
-case class IntermediateJoin(leftColName: String, rightColName: String, right: Intermediate, name: String)
-
-case class IntermediateFrom(tableName: String, joins: List[IntermediateJoin])
-
-case class Intermediate(cols: List[String], from: IntermediateFrom, field: CField)
-
-
 // A table will at least be an object so no need to support scalars
 sealed trait SQLResponseType {
   def wrapInErrorHandling(fieldNameOfObject: String, tableSql: String): String
 }
 case object ObjectResponse extends SQLResponseType {
-  override def wrapInErrorHandling(fieldNameOfObject: String, tableSql: String): String =
+  override def wrapInErrorHandling(
+      fieldNameOfObject: String,
+      tableSql: String
+  ): String =
     s"""
        |select coalesce((json_agg("$fieldNameOfObject") -> 0), 'null') as "$fieldNameOfObject"
        |from (
@@ -80,7 +102,10 @@ case object ObjectResponse extends SQLResponseType {
        |""".stripMargin
 }
 case object ListResponse extends SQLResponseType {
-  override def wrapInErrorHandling(fieldNameOfObject: String, tableSql: String): String =
+  override def wrapInErrorHandling(
+      fieldNameOfObject: String,
+      tableSql: String
+  ): String =
     s"""
        |select coalesce(json_agg("$fieldNameOfObject"), '[]') as "$fieldNameOfObject"
        |from (
@@ -89,663 +114,1637 @@ case object ListResponse extends SQLResponseType {
        |""".stripMargin
 }
 
-case class IntermediateColumn(nameInTable: String, outputName: String) // What about function columns?
-case class IntermediateJoinV2(leftColName: String, rightColName: String, right: IntermediateV2, name: String)
+case class IntermediateColumn(
+    nameInTable: String,
+    outputName: String
+) // What about function columns?
+case class IntermediateJoinV2(
+    leftColName: String,
+    rightColName: String,
+    right: IntermediateV2,
+    name: String
+)
 
-case class IntermediateFromV2(tableName: String, joins: List[IntermediateJoinV2]) // What about functions?
+case class IntermediateFromV2(
+    tableName: String,
+    joins: List[IntermediateJoinV2]
+) // What about functions?
 sealed trait IntermediateV2 {
   def from: IntermediateFromV2
   def cols: List[IntermediateColumn]
   def responseType: SQLResponseType
+  def where: List[String]
+  def pagination: Option[String]
+  def fieldName: String
+  def dataId: String = s"${fieldName}_data"
 }
 case class IntermediateV2Regular(
-                                  cols: List[IntermediateColumn],
-                                  from: IntermediateFromV2,
-                                  responseType: SQLResponseType,
-                                  condition: Option[String],
-                                  ordering: Option[String]
-                                ) extends IntermediateV2
+    cols: List[IntermediateColumn],
+    from: IntermediateFromV2,
+    responseType: SQLResponseType,
+    condition: Option[String],
+    ordering: Option[String],
+    sizing: String, //Limit and optionally offset
+    where: List[String],
+    pagination: Option[String],
+    fieldName: String
+) extends IntermediateV2
 case class IntermediateV2Union(
-                                discriminatorFieldName: String,
-                                discriminatorMapping: Map[String, List[IntermediateColumn]],
-                                from: IntermediateFromV2,
-                                responseType: SQLResponseType,
-                                condition: Option[String],
-                                ordering: Option[String]
-                              ) extends IntermediateV2 {
+    discriminatorFieldName: String,
+    discriminatorMapping: Map[String, List[IntermediateColumn]],
+    from: IntermediateFromV2,
+    responseType: SQLResponseType,
+    condition: Option[String],
+    ordering: Option[String],
+    sizing: String, // Limit and optionally offset
+    where: List[String],
+    pagination: Option[String],
+    fieldName: String
+) extends IntermediateV2 {
   override def cols: List[IntermediateColumn] = Nil
-}
-
-case class IntermediateUnion(discriminatorColumn: String, columnsByDiscriminatorValue: Map[String, List[String]]) {
-  def toSQL(field: CField) : String =  {
-    val baseTableName = "whatever"
-    val childrenTypesFetched = field.fields.flatMap(_.parentType).flatMap(_.name).distinct
-    childrenTypesFetched match {
-      case Nil => ""
-      case ::(head, Nil) => ""
-      case ::(head, tl) =>
-        val childTypeSQL = columnsByDiscriminatorValue.map { case (tpe, columns) =>
-          val queriedFieldsForThisType = field.fields.filter(_.parentType.flatMap(_.name).exists(_.contentEquals(tpe)))
-          val columnEntries = columns
-            .filter(column => queriedFieldsForThisType.exists(_.name.contentEquals(column)))
-            .map { column =>
-              s"""'$column', "${baseTableName}_data"."$column""""
-            } ++ List(s"""'__typename', '${tpe}'""")
-
-          s"""when "${baseTableName}_data"."$discriminatorColumn" = '${tpe}'
-             |    then json_build_object(${columnEntries.mkString(",")})""".stripMargin
-        }
-        s"""select "json_spec"."object"
-           |from (
-           |  select case ${childTypeSQL.mkString("\n")}
-           |              end as "object"
-           |) as "json_spec"
-           |
-           |""".stripMargin
-    }
-
-
-  }
 }
 
 case class FunctionInfo(name: String, comments: String, functionType: Short)
 
-case class FunctionColumnInfo(functionName: String, columnName: String, columnType: Short, dataType: Int, typeName: String, nullable: Boolean, comments: String)
+case class FunctionColumnInfo(
+    functionName: String,
+    columnName: String,
+    columnType: Short,
+    dataType: Int,
+    typeName: String,
+    nullable: Boolean,
+    comments: String
+)
 
-case class ProcedureColumnInfo(procedureName: String, columnName: String, columnType: Short, dataType: Int, nullable: Boolean)
+case class ProcedureColumnInfo(
+    procedureName: String,
+    columnName: String,
+    columnType: Short,
+    dataType: Int,
+    nullable: Boolean
+)
 
 case class ProcedureInfo(name: String, comments: String)
 
-case class PrimaryKeyInfo(columnName: String, keySeq: Int, tableName: String, pkName: String)
+case class PrimaryKeyInfo(
+    columnName: String,
+    keySeq: Int,
+    tableName: String,
+    pkName: String
+)
 
 case class TableInfo(name: String, comment: String)
 
-case class ColumnInfo(name: String, nullable: Boolean, sqltype: Int, typeName: String, tableName: String)
+case class ColumnInfo(
+    name: String,
+    nullable: Boolean,
+    sqltype: Int,
+    typeName: String,
+    tableName: String
+) {
+  import Version2._
+  def toScalaType: Version2.ScalaType = {
+    sqltype match {
+      case 4    => ScalaInt
+      case 12   => ScalaString
+      case 1111 => ScalaUUID
+      case 93   => ScalaZonedDataTime
+    }
+  }
+}
 
-case class IndexInfo(tableName: String, indexName: String, indexType: Int, columnName: String, nonUnique: Boolean)
+case class IndexInfo(
+    tableName: String,
+    indexName: String,
+    indexType: Int,
+    columnName: String,
+    nonUnique: Boolean
+)
 
-case class ExportedKeyInfo(pkTableName: String, pkColumnName: String, fkTableName: String, fkColumnName: String, keySeq: Int, pkName: Option[String], fkName: Option[String]) {
+case class ExportedKeyInfo(
+    pkTableName: String,
+    pkColumnName: String,
+    fkTableName: String,
+    fkColumnName: String,
+    keySeq: Int,
+    pkName: Option[String],
+    fkName: Option[String]
+) {
   def renderSelf(): String = {
-    val renderedPkName = pkName.map(name =>s"""Some("${name}")""").getOrElse("None")
-    val renderedFkName = fkName.map(name=> s"""Some("$name")""").getOrElse("None")
+    val renderedPkName =
+      pkName.map(name => s"""Some("${name}")""").getOrElse("None")
+    val renderedFkName =
+      fkName.map(name => s"""Some("$name")""").getOrElse("None")
     s"""ExportedKeyInfo("$pkTableName", "$pkColumnName", "$fkTableName", "$fkColumnName", $keySeq, $renderedPkName, $renderedFkName)"""
   }
 }
 
-case class ImportedKeyInfo(pkTableName: String, pkColumnName: String, fkTableName: String, fkColumnName: String, keySeq: Int, pkName: Option[String], fkName: Option[String])
+case class ImportedKeyInfo(
+    pkTableName: String,
+    pkColumnName: String,
+    fkTableName: String,
+    fkColumnName: String,
+    keySeq: Int,
+    pkName: Option[String],
+    fkName: Option[String]
+)
 
-case class Column(name: String, nullable: Boolean, sqltype: Int, typeName: String, unique: Boolean) {
+case class Column(
+    name: String,
+    nullable: Boolean,
+    sqltype: Int,
+    typeName: String,
+    unique: Boolean
+) {
+  import Version2._
   def renderSelf(): String = {
     s"""Column("$name", $nullable, $sqltype, "$typeName", $unique)"""
   }
 
   def matchesName(name: String): Boolean = this.name.contentEquals(name)
-}
 
-
-case class Table(name: String, primaryKeys: List[Column], otherColumns: List[Column], comments: String, relationships: List[ExportedKeyInfo] = Nil) {
-  def renderSelf(): String = {
-    val renderedPrimaryKeys = primaryKeys.map(_.renderSelf()).mkString("List(", ",", ")")
-    val renderedOtherColumns = otherColumns.map(_.renderSelf()).mkString("List(",",", ")")
-    val renderedRelationships = relationships.map(_.renderSelf()).mkString("List(", ",", ")")
-    s"""Table("${name}", $renderedPrimaryKeys, $renderedOtherColumns, "$comments", $renderedRelationships)"""
+  def toScalaType(): Version2.ScalaType = {
+    sqltype match {
+      case 4    => ScalaInt
+      case 12   => ScalaString
+      case 1111 => ScalaUUID
+      case 93   => ScalaZonedDataTime
+    }
   }
-
-  def matchesName(name: String): Boolean = this.name.contentEquals(name)
 }
-
 
 sealed trait SQLType
 
 case object Integer extends SQLType
 
-sealed trait ScalaType {
-  def render: String
+object Whatever {
+  sealed trait Table {
+    def matchesName(name: String): Boolean
+    def name: String
+    def tableColumns: List[Column]
+    def relationships: List[ExportedKeyInfo]
+    def toPaginationParams: MethodParam
+    def renderSelf: String
+    def objectExtensions: List[Version2.ObjectExtension]
 
-  def name: String
+    def extractPaginationSizing(field: CField): String
 
-  def isQuoted: Boolean
-
-  def to__Type: __Type
-}
-
-sealed trait BaseType extends ScalaType
-
-case object UUIDType extends BaseType {
-  override def render: String = "UUID"
-
-  override def name: String = "UUID"
-
-  override def isQuoted: Boolean = true
-
-  override def to__Type: __Type = Types.makeScalar("ID",None)
-}
-
-case object IntegerType extends BaseType {
-  override def render: String = "Int"
-
-  override def name: String = "Int"
-
-  override def isQuoted: Boolean = false
-
-  override def to__Type: __Type = Types.int
-}
-
-case object StringType extends BaseType {
-  override def render: String = "String"
-
-  override def name: String = render
-
-  override def isQuoted: Boolean = true
-
-  override def to__Type: __Type = Types.string
-}
-
-case object ZonedDateTimeType extends BaseType {
-  override def render: String = "ZonedDateTime"
-
-  override def name: String = render
-
-  override def isQuoted: Boolean = true
-
-  override def to__Type: __Type = Types.makeScalar("ZonedDateTime")
-}
-
-sealed trait ContainerType extends ScalaType
-
-case class ListType(elementType: ScalaType) extends ContainerType {
-  override def render: String = s"List[${elementType.name}]"
-
-  override def name: String = render
-
-  override def isQuoted: Boolean = false
-
-  override def to__Type: __Type = Types.makeList(elementType.to__Type)
-}
-
-case class OptionType(elementType: ScalaType) extends ContainerType {
-  override def render: String = s"Option[${elementType.name}]"
-
-  override def name: String = render
-
-  override def isQuoted: Boolean = elementType.isQuoted
-
-  override def to__Type: __Type = elementType.to__Type
-}
-
-sealed trait FieldType {
-  def toName(): String
-  def strict(): ScalaType
-}
-
-case class Concrete(scalaType: ScalaType) extends FieldType {
-  override def toName(): String = scalaType.name
-
-  override def strict(): ScalaType = scalaType
-
-}
-
-case class Reference(scalaType: () => ScalaType) extends FieldType {
-  override def toName(): String = scalaType().name
-
-  override def strict(): ScalaType = scalaType()
-}
-
-case class Field(name: String, scalaType: FieldType, isPrimaryKey: Boolean, isExtension: Boolean, requires: List[String], isRelationship: Boolean, isExternal: Boolean = false)
-
-case class CaseClassType(name: String, fields: List[Field], isBaseTableClass: Boolean = false,  isInsertForTable: Option[String] = None, isUpdateForTable: Option[String] = None, isDeleteForTable: Option[String] = None, isFederationArg: Option[String] = None, externalKeys: Option[String] = None) extends ScalaType {
-  def render = {
-    val fieldRendering = fields.map { field =>
-      val typeRendering = field.scalaType match {
-        case Concrete(scalaType) => scalaType.name
-        case Reference(scalaType) => scalaType().name
+    def extractExtensionArgTypes(): List[CaseClassType2] = {
+      objectExtensions.flatMap { objectExtension =>
+        extractExtensionArgType(objectExtension)
       }
-      s"${field.name}: ${typeRendering}"
-    }
-    s"case class ${name}(${fieldRendering.mkString(",")})"
-  }
-
-  def renderWithFederation() = {
-    val fieldRendering = fields.map { field =>
-      val typeRendering = field.scalaType match {
-        case Concrete(scalaType) => scalaType.name
-        case Reference(scalaType) => scalaType().name
-      }
-      s"${field.name}: ${typeRendering}"
     }
 
-    val keys = fields.filter(_.isPrimaryKey).map(_.name)
+    def extractExtensionArgType(
+        extension: Version2.ObjectExtension
+    ): Option[CaseClassType2] = {
+      extension.field.requiredFields match {
+        case Nil => None
+        case list =>
+          val fields = list
+            .flatMap(reqField =>
+              this.tableColumns.find(_.matchesName(reqField))
+            )
+            .map(col => Field2(col.name, col.toScalaType(), Nil, Nil))
+          Option(
+            CaseClassType2(
+              s"${extension.objectName}${extension.field.fieldName}ExtensionArg",
+              fields,
+              Nil,
+              Nil
+            )
+          )
+      }
+    }
 
-    if(keys.nonEmpty) {
-      s"""@GQLDirective(Key("${keys.mkString(" ")}")) case class ${name}(${fieldRendering.mkString(",")})"""
-    } else {
-      s"""case class ${name}(${fieldRendering.mkString(",")})"""
+    def extractPkSelector(): Option[CaseClassType2]
+
+    def extractArgTypes: List[CaseClassType2] = {
+      extractPaginationArgTypes ++ extractPkSelector().toList ++ List(
+        extractCreateInput
+      )
+    }
+
+    def extractPaginationArgTypes: List[CaseClassType2]
+
+    def toExtensionMethods(): List[Method2] = {
+      this.objectExtensions.map { extension =>
+        val params = extractExtensionArgType(extension).map { extensionArg =>
+          MethodParam(extensionArg.name, extensionArg)
+        }.toList
+        Method2(
+          s"${extension.objectName}${extension.field.fieldName}",
+          List(params),
+          Nil,
+          extension.field.tpe
+        )
+      }
+    }
+
+    def extractPaginationCondition(field: CField): String
+
+    def extractCreateInput: CaseClassType2 = {
+      CaseClassType2(
+        s"${name}CreateInput",
+        this.tableColumns.map(col =>
+          Field2(col.name, col.toScalaType(), Nil, Nil)
+        ),
+        Nil,
+        Nil
+      )
+    }
+
+    def toUnifiedModel(tables: List[Whatever.Table]): Version2.ScalaType
+
+    def toCreateField(tables: List[Whatever.Table]): Field2 = {
+      val argClass = extractCreateInput
+      Field2(
+        s"create_${name}",
+        ScalaOption(toUnifiedModel(tables)),
+        Nil,
+        List(MethodParam("args", argClass))
+      )
     }
   }
+  case class PrimaryKeyTable(
+      name: String,
+      primaryKeys: NonEmptyChunk[Column],
+      otherColumns: List[Column],
+      comments: String,
+      relationships: List[ExportedKeyInfo],
+      objectExtensions: List[Version2.ObjectExtension]
+  ) extends Table {
 
-  def render2() = {
-    val fieldRendering = fields.map { field =>
-      val typeRendering = field.scalaType match {
-        case Concrete(scalaType) => scalaType.name
-        case Reference(scalaType) => scalaType().name
+    def extractFederatedCondition(input: InputValue): String = {
+      primaryKeys
+        .map { column =>
+          val values = CodegenUtils.extractColumnsValueFromFederatedArguments(
+            column,
+            input
+          )
+          s"${column.name} in (${values.mkString(", ")})"
+        }
+        .mkString(" AND ")
+    }
+
+    def getByIdParams(): List[MethodParam] = {
+      List(MethodParam("pk", toPk()))
+    }
+
+    def toModel(tables: List[Table]): CaseClassType2 = {
+      val federationKey = primaryKeys.map(_.name).mkString("\"", " ", "\"")
+      val federationAnnotation =
+        s"""@GQLDirective(federation.Key($federationKey))"""
+      val fields = this.tableColumns.map { column =>
+        Field2(column.name, column.toScalaType(), Nil, Nil)
       }
-      s"${field.name}: ${typeRendering}"
+
+      val extensionFields = objectExtensions.map { extension =>
+        Field2(extension.field.fieldName, extension.field.tpe, Nil, Nil)
+      }
+      CaseClassType2(
+        name,
+        fields.toList ++ createRelationshipFields2(
+          this,
+          tables
+        ) ++ extensionFields,
+        List(federationAnnotation),
+        Nil
+      )
     }
 
-    val caseClassDefinition = s"""case class ${name}(${fieldRendering.mkString(",")}) """
-
-    val extendsClauses = List(
-      if (isUpdateForTable.nonEmpty) Option("UpdateInput") else None,
-      if (isInsertForTable.nonEmpty) Option("InsertInput") else None,
-      if (isDeleteForTable.nonEmpty) Option("DeleteInput") else None,
-      if(isFederationArg.nonEmpty) Option("FederationArg") else None
-    ).flatten match {
-      case Nil => ""
-      case list => list.mkString("extends ", " with ", "")
+    def toPk(): CaseClassType2 = {
+      CaseClassType2(
+        s"${name}_PK",
+        primaryKeys
+          .map(col => Field2(col.name, col.toScalaType(), Nil, Nil))
+          .toList,
+        Nil,
+        Nil
+      )
     }
 
-    val insertMethod = isInsertForTable match {
-      case Some(value) => s"""def toInsert(): String = {
-                             |  ${renderToInsert(value)}
-                             | }""".stripMargin
-      case None => ""
+    override def tableColumns: List[Column] =
+      (primaryKeys.toList ++ otherColumns)
+
+    def createPaginationParamType: CaseClassType2 = {
+      CaseClassType2(
+        s"${name}_PaginationParams",
+        List(
+          Field2("last", ScalaOption(toPk()), Nil, Nil),
+          Field2("pageSize", ScalaInt, Nil, Nil)
+        ),
+        Nil,
+        Nil
+      )
     }
 
-    val updateMethod = isUpdateForTable match {
-      case Some(value) =>
-        s"""def toUpdate(): String = {
-           |  ${renderToUpdate(value)}
-           | }""".stripMargin
-      case None => ""
+    def toPaginationParams(): MethodParam = {
+      MethodParam("pagination", createPaginationParamType)
     }
 
-    val deleteMethod = isDeleteForTable match {
-      case Some(value) =>
-        s"""def toDelete(): String = {
-           |  ${renderToDelete(value)}
-           | }""".stripMargin
-      case None => ""
+    def extractPaginationCondition(field: CField): String = {
+      println(
+        s"extractPaginationCondition on ${field.arguments}. FOr table $name"
+      )
+      val last =
+        field.arguments
+          .get("last")
+          .toList
+          .flatMap { inputValue =>
+            toPk().fields
+              .flatMap { pk =>
+                val res = CodegenUtils
+                  .extactFieldValueFromObject(pk, inputValue)
+                  .map(str => s"${pk.name} > ${str}")
+                println(s"SYMBOLIC: ${pk.name} -> ${inputValue}. REAL $res")
+                res
+              }
+          }
+
+      println(s"LAST: $last")
+      (last).mkString(" AND ")
+    }
+    def extractSingleItemCondition(field: CField): String = {
+      primaryKeys.toList
+        .flatMap { column =>
+          CodegenUtils.extractColumnValueFromObject(
+            column,
+            field.arguments
+          )
+        }
+        .mkString(" AND ")
     }
 
-    val federationMethod = isFederationArg match {
-      case Some(value) =>
-        s"""def toSelect(): String =  {
-           |  ${renderFederationArg()}
-           | }""".stripMargin
-      case None => ""
+    override def renderSelf: String = {
+      val renderedPrimaryKeys =
+        primaryKeys.map(_.renderSelf()).mkString("NonEmptyChunk(", ", ", ")")
+      val renderedOtherColumns =
+        s"List(" ++ otherColumns.map(_.renderSelf()).mkString(",") ++ ")"
+      val renderedRelationships = {
+        s"List(" ++ relationships.map(_.renderSelf()).mkString(",") ++ ")"
+      }
+      val renderedExtensions =
+        s"List(" ++ objectExtensions.map(_.renderSelf()).mkString(", ") ++ ")"
+      s"""PrimaryKeyTable(
+          "$name",
+          $renderedPrimaryKeys,
+          $renderedOtherColumns,
+          "$comments",
+          $renderedRelationships,
+          $renderedExtensions
+          )"""
     }
 
-    val convenienceMethods = List(insertMethod, updateMethod, deleteMethod, federationMethod).filter(_.nonEmpty)
-    val implementation =
-      if(convenienceMethods.isEmpty) ""
-      else
-        s"""{
-           | ${convenienceMethods.mkString("\n")}
+    override def extractPaginationArgTypes: List[CaseClassType2] = {
+      List(createPaginationParamType, toPk())
+    }
+
+    override def extractPkSelector(): Option[CaseClassType2] = {
+      Option(
+        toPk()
+      )
+    }
+
+    override def matchesName(name: String): Boolean =
+      this.name.contentEquals(name)
+
+    override def toUnifiedModel(tables: List[Table]): Version2.ScalaType =
+      toModel(tables)
+
+    override def extractPaginationSizing(field: CField): String = {
+      val pageSize = field.arguments
+        .get("pageSize")
+        .flatMap(CodegenUtils.convertTo[Int](_))
+        .getOrElse(25)
+
+      s"limit $pageSize"
+    }
+  }
+  case class NonPrimaryKeyTable(
+      name: String,
+      columns: List[Column],
+      comments: String,
+      relationships: List[ExportedKeyInfo],
+      objectExtensions: List[Version2.ObjectExtension]
+  ) extends Table {
+    override def tableColumns: List[Column] = columns
+
+    override def renderSelf: String = {
+      val renderedOtherColumns =
+        s"List(" ++ columns.map(_.renderSelf()).mkString(",") ++ ")"
+      val renderedRelationships =
+        s"List(" ++ relationships.map(_.renderSelf()).mkString(",") ++ ")"
+      val renderedExtensions =
+        s"List(" ++ objectExtensions.map(_.renderSelf()).mkString(", ") ++ ")"
+
+      s"""NonPrimaryKeyTable(
+         |  "$name",
+         |  $renderedOtherColumns,
+         |  "$comments",
+         |  $renderedRelationships,
+         |  $renderedExtensions
+         |)
+         |""".stripMargin
+    }
+
+    def toModel(tables: List[Table]): CaseClassType2 = {
+      val extensionFields = objectExtensions.map { extension =>
+        Field2(extension.field.fieldName, extension.field.tpe, Nil, Nil)
+      }
+
+      CaseClassType2(
+        name,
+        columns.map(col =>
+          Field2(col.name, col.toScalaType(), Nil, Nil)
+        ) ++ createRelationshipFields2(this, tables) ++ extensionFields,
+        Nil,
+        Nil
+      )
+    }
+
+    def createPaginationParamType: CaseClassType2 = {
+      CaseClassType2(
+        "NoPKPagination",
+        List(
+          Field2("offset", ScalaOption(ScalaInt), Nil, Nil),
+          Field2("limit", ScalaInt, Nil, Nil)
+        ),
+        Nil,
+        Nil
+      )
+    }
+
+    def toPaginationParams(): MethodParam = {
+      MethodParam("pagination", createPaginationParamType)
+    }
+
+    def extractPaginationCondition(field: CField): String = {
+      val defaultLimit = 25
+      val limit = field.arguments
+        .get("limit")
+        .flatMap(inputValue => CodegenUtils.convertTo[Int](inputValue))
+        .getOrElse(defaultLimit)
+      val offset = field.arguments
+        .get("offset")
+        .flatMap(inputValue => CodegenUtils.convertTo[Int](inputValue))
+
+      (List(s"limit = $limit") ++ offset.map(offset => s"offset = $offset"))
+        .mkString(" AND ")
+
+      ""
+    }
+
+    override def extractPaginationArgTypes: List[CaseClassType2] = List(
+      createPaginationParamType
+    )
+
+    override def extractPkSelector(): Option[CaseClassType2] = None
+
+    override def matchesName(name: String): Boolean =
+      this.name.contentEquals(name)
+
+    override def toUnifiedModel(tables: List[Table]): Version2.ScalaType =
+      toModel(tables)
+
+    override def extractPaginationSizing(field: CField): String = {
+      val defaultLimit = 25
+      val offset = field.arguments
+        .get("offset")
+        .flatMap(inputValue => CodegenUtils.convertTo[Int](inputValue))
+
+      val limit = field.arguments
+        .get("limit")
+        .flatMap(inputValue => CodegenUtils.convertTo[Int](inputValue))
+        .getOrElse(defaultLimit)
+      (offset.map(int => s"offset $int").toList ++ List(s"limit $limit"))
+        .mkString(" ")
+    }
+  }
+}
+
+object CodegenUtils {
+  def convertTo[A](
+      inputValue: InputValue
+  )(implicit decoder: Decoder[A]): Option[A] = {
+    InputValue.circeEncoder.apply(inputValue).as[A].toOption
+  }
+
+  def extractColumnsValueFromFederatedArguments(
+      column: Column,
+      input: InputValue
+  ): List[String] = {
+
+    val columnValuesAsJson = input
+      .asJson(InputValue.circeEncoder)
+      .asObject
+      .flatMap(_.apply(column.name))
+
+    println(
+      s"extractColumnsValueFromFederatedArguments: ${column.name}. $input $columnValuesAsJson"
+    )
+
+    column.toScalaType() match {
+      case baseType: Version2.BaseType =>
+        baseType match {
+          case Version2.ScalaInt =>
+            columnValuesAsJson
+              .flatMap(_.as[Int].toOption)
+              .map(int => s"$int")
+              .toList
+          case Version2.ScalaString =>
+            columnValuesAsJson
+              .flatMap(_.as[String].toOption)
+              .map(str => s"'$str'")
+              .toList
+          case Version2.ScalaUUID =>
+            columnValuesAsJson
+              .flatMap(_.as[UUID].toOption)
+              .map(uuid => s"'$uuid'")
+              .toList
+          case Version2.ScalaZonedDataTime =>
+            columnValuesAsJson
+              .flatMap(_.as[ZonedDateTime].toOption)
+              .map(dt =>
+                s"'${dt.format(DateTimeFormatter.ISO_ZONED_DATE_TIME)}'"
+              )
+              .toList
+        }
+      case _ => Nil
+    }
+  }
+
+  def extractColumnValueFromObject(
+      column: Column,
+      inputValue: Map[String, InputValue]
+  ): Option[String] = {
+
+    val json =
+      inputValue.get(column.name).map(_.asJson(InputValue.circeEncoder))
+
+    println(s"extractColumnValueFromObject: ${column.name}. $inputValue $json")
+    column.toScalaType() match {
+      case baseType: Version2.BaseType =>
+        baseType match {
+          case Version2.ScalaInt =>
+            json.flatMap(
+              _.as[Int].toOption.map(int => s"${column.name} = $int")
+            )
+          case Version2.ScalaString =>
+            json.flatMap(
+              _.as[String].toOption
+                .map(string => s"${column.name} = '$string'")
+            )
+
+          case Version2.ScalaUUID =>
+            json.flatMap(
+              _.as[UUID].toOption
+                .map(uuid => s"${column.name} = '${uuid.toString}'")
+            )
+
+          case Version2.ScalaZonedDataTime =>
+            json.flatMap(
+              _.as[ZonedDateTime].toOption
+                .map(dt =>
+                  s"${column.name} = '${dt.format(DateTimeFormatter.ISO_ZONED_DATE_TIME)}'"
+                )
+            )
+
+        }
+      case _ => None
+    }
+  }
+
+  def extactFieldValueFromObject(
+      pk: Field2,
+      inputValue: InputValue
+  ): Option[String] = {
+    val pkField = inputValue
+      .asJson(InputValue.circeEncoder)
+      .asObject
+      .flatMap(_.apply(pk.name))
+    println(s"PK: $pk INPUT: $inputValue PKFIELD: $pkField")
+    pk.scalaType match {
+      case baseType: Version2.BaseType =>
+        baseType match {
+          case Version2.ScalaInt =>
+            pkField.flatMap(_.as[Int].toOption).map(int => s"$int")
+          case Version2.ScalaString =>
+            pkField
+              .flatMap(_.as[String].toOption)
+              .map(str => s"'$str'")
+          case Version2.ScalaUUID =>
+            pkField
+              .flatMap(_.as[UUID].toOption)
+              .map(uuid => s"'${uuid.toString}'")
+          case Version2.ScalaZonedDataTime =>
+            pkField
+              .flatMap(_.as[ZonedDateTime].toOption)
+              .map(dt =>
+                s"'${dt.format(DateTimeFormatter.ISO_ZONED_DATE_TIME)}'"
+              )
+        }
+      case _ => None
+    }
+  }
+}
+
+object Version2 {
+  // Mutual referencing: Type A depends on type B who depends on type A
+  // Mutual referencing is everywhere in graphql
+  // This creates an initialization problem
+  // If we want to create a type for A we need a type for B, but we haven't initialized B yet
+  // If we then want to initialize B we need A, this presents a problem
+  // Fortunately this is trivially fixed by introducing laziness
+  // We just put all types in a map and instead of a field being a strict scala type its a lazy one
+  // Once all types are initialized we can simply find the types in the typemap
+  // This is fine or our usecase as long as we stick with the following rules
+  // 1. during initialization we only put stuff into the map
+  // 2. during rendering we fetch things out of the map
+  // This approach is obviously not threadsafe, but concurrency is not really right now
+  // The following alternatives were considered
+  // - Statemonad or similar (invasive type signatures)
+  // - Passing the map around (horribly error prone)
+  type TableName = String
+  val globalTypeMap = mutable.Map[TableName, ScalaType]()
+
+  case class ObjectField(
+      fieldName: String,
+      tpe: ScalaType,
+      requiredFields: List[String],
+      isExternal: Boolean = false
+  ) {
+    def renderSelf(): String = {
+      s"""ObjectField(
+          "$fieldName", 
+          ${tpe.renderSelf}, 
+          ${requiredFields.map(str => s""""$str"""")},
+          $isExternal)"""
+    }
+  }
+  case class ObjectExtension(objectName: String, field: ObjectField) {
+    def renderSelf(): String = {
+      s"""ObjectExtension("$objectName", ${field.renderSelf()})"""
+    }
+  }
+
+  sealed trait EffectWrapper {
+    def wrap(name: String): String
+  }
+  case object ZQueryEffectWrapper extends EffectWrapper {
+    override def wrap(name: String): String = s"ZQuery[Any, Throwable, $name]"
+  }
+  case object ZIOEffectWrapper extends EffectWrapper {
+    override def wrap(name: String): String = s"ZIO[Any,Throwable, $name]"
+  }
+  case object NoEffectWrapper extends EffectWrapper {
+    override def wrap(name: String): String = s"$name"
+  }
+
+  sealed trait ScalaType {
+    def render(effect: EffectWrapper): String
+
+    def nameWithWrapper(effect: EffectWrapper): String
+
+    def name: String
+
+    def isQuoted: Boolean
+
+    def to__Type: __Type
+
+    def to__InputValue: __InputValue
+
+    def renderSelf: String
+  }
+  sealed trait BaseType extends ScalaType {
+    override def render(effect: EffectWrapper): String = name
+
+    override def nameWithWrapper(effect: EffectWrapper): String = name
+
+    override def to__InputValue: __InputValue =
+      __InputValue(name, None, () => to__Type, None, None)
+  }
+
+  case object ScalaInt extends BaseType {
+    override def name: String = "Int"
+
+    override def isQuoted: Boolean = false
+
+    override def to__Type: __Type = Types.int
+
+    override def renderSelf: String = "ScalaInt"
+  }
+
+  case object ScalaString extends BaseType {
+    override def name: String = s"String"
+
+    override def isQuoted: Boolean = true
+
+    override def to__Type: __Type = Types.string
+
+    override def renderSelf: String = "ScalaString"
+  }
+
+  case object ScalaUUID extends BaseType {
+    override def name: String = "UUID"
+
+    override def isQuoted: Boolean = true
+
+    override def to__Type: __Type = Types.string
+
+    override def renderSelf: String = "ScalaUUID"
+  }
+
+  case object ScalaZonedDataTime extends BaseType {
+    override def name: String = "ZonedDateTime"
+
+    override def isQuoted: Boolean = true
+
+    override def to__Type: __Type = Types.makeScalar("ZonedDateTime")
+
+    override def renderSelf: String = "ScalaZonedDateTime"
+  }
+
+  sealed trait ContainerType extends ScalaType
+  case class ScalaOption(inner: ScalaType) extends ContainerType {
+    override def name: String = s"Option[${inner.name}]"
+
+    override def isQuoted: Boolean = inner.isQuoted
+
+    override def to__Type: __Type = inner.to__Type
+
+    override def render(effect: EffectWrapper): String = name
+
+    override def nameWithWrapper(effect: EffectWrapper): String = name
+
+    override def to__InputValue: __InputValue = inner.to__InputValue
+
+    override def renderSelf: String = s"ScalaOption(${inner.renderSelf})"
+  }
+
+  case class ScalaList(inner: ScalaType) extends ContainerType {
+    override def name: String = s"List[${inner.name}]"
+
+    override def isQuoted: Boolean = true
+
+    override def to__Type: __Type = Types.makeList(inner.to__Type)
+
+    override def render(effect: EffectWrapper): String = name
+
+    override def nameWithWrapper(effect: EffectWrapper): String = name
+
+    override def to__InputValue: __InputValue = inner.to__InputValue
+
+    override def renderSelf: String = s"ScalaList(${inner.renderSelf})"
+  }
+
+  case class AbstractEffect(inner: ScalaType) extends ContainerType {
+    override def render(effect: EffectWrapper): String = inner.name
+
+    override def nameWithWrapper(effect: EffectWrapper): String =
+      effect.wrap(name)
+
+    override def name: String = inner.name
+
+    override def isQuoted: Boolean = false
+
+    override def to__Type: __Type = inner.to__Type
+
+    override def to__InputValue: __InputValue = inner.to__InputValue
+
+    override def renderSelf: String = s"AbstractEffect(${inner.renderSelf})"
+  }
+
+  case class CaseClassType2(
+      name: String,
+      fields: List[Field2],
+      annotations: List[String],
+      extendsClauses: List[String]
+  ) extends ScalaType {
+    def render(effect: EffectWrapper): String = {
+      val extensions = extendsClauses match {
+        case Nil  => ""
+        case list => s"extends ${list.mkString(" with ")}"
+      }
+
+      s"""${annotations.mkString("")} case class $name(${fields
+        .map(_.render(effect))
+        .mkString(",")}) $extensions"""
+    }
+
+    override def nameWithWrapper(effect: EffectWrapper): String =
+      effect.wrap(name)
+
+    override def isQuoted: Boolean = false
+
+    override def to__Type: __Type = Types.makeObject(
+      Option(name),
+      None,
+      fields.map(_.to__Field),
+      Nil,
+      None
+    )
+
+    override def to__InputValue: __InputValue = __InputValue(
+      name,
+      None,
+      () => to__Type,
+      None,
+      None
+    )
+
+    override def renderSelf: String = {
+      s"""CaseClassType2("$name", List(${fields
+        .map(_.renderSelf())
+        .mkString(", ")}), List(${annotations
+        .map(str => s""""$str"""")
+        .mkString(", ")}), List(${extendsClauses
+        .map(str => s""""$str"""")
+        .mkString(", ")}))"""
+    }
+  }
+
+  case class TypeReference(tpe: () => ScalaType) extends ScalaType {
+    override def render(effect: EffectWrapper): String = tpe().render(effect)
+
+    override def nameWithWrapper(effect: EffectWrapper): String =
+      tpe().nameWithWrapper(effect)
+
+    override def name: String = tpe().name
+
+    override def isQuoted: Boolean = tpe().isQuoted
+
+    override def to__Type: __Type = tpe().to__Type
+
+    override def to__InputValue: __InputValue = tpe().to__InputValue
+
+    override def renderSelf: String = tpe().renderSelf
+  }
+
+  case class Field2(
+      name: String,
+      scalaType: ScalaType,
+      annotations: List[String],
+      arguments: List[MethodParam]
+  ) {
+    def render(effect: EffectWrapper): String = {
+      val args = arguments match {
+        case Nil           => ""
+        case ::(head, Nil) => s"${head.tpe.name} =>"
+        case list =>
+          list.map(_.tpe.name).mkString("(", ", ", ") =>")
+      }
+
+      s"""${annotations.mkString("")} $name: $args ${scalaType.nameWithWrapper(
+        effect
+      )}"""
+    }
+
+    def to__Field: __Field = (
+      __Field(name, None, Nil, () => scalaType.to__Type, false, None, None)
+    )
+
+    def renderSelf(): String = {
+      s"""Field2("$name", ${scalaType.renderSelf}, List(${annotations
+        .map(str => s""""$str"""")
+        .mkString(", ")}), List(${arguments
+        .map(_.renderSelf())
+        .mkString(", ")}))"""
+    }
+  }
+
+  case class MethodParam(name: String, tpe: ScalaType) {
+    def render: String = {
+      s"""$name: ${tpe.name}"""
+    }
+
+    def renderSelf(): String = {
+      s"""MethodParam("$name", ${tpe.renderSelf})"""
+    }
+  }
+  // List[List[MethodParam]] to support currying
+  case class Method2(
+      name: String,
+      params: List[List[MethodParam]],
+      implicits: List[MethodParam],
+      returnType: ScalaType
+  ) {
+    def renderSignature(effectWrapper: EffectWrapper): String = {
+      val renderedImplicits = implicits match {
+        case Nil  => ""
+        case list => list.mkString("(", ", ", ")")
+      }
+      s"def ${name}${params.map(_.map(_.render).mkString(",")).mkString("(", ")(", ")")}$renderedImplicits: ${effectWrapper
+        .wrap(returnType.name)}"
+    }
+  }
+
+  case class ScalaTrait(name: String, methods: List[Method2]) {
+    def render(effectWrapper: EffectWrapper): String = {
+      s"""trait $name {
+         | ${methods.map(_.renderSignature(effectWrapper))}
+         |}""".stripMargin
+    }
+  }
+
+  case class GeneratedMethod(
+      name: String,
+      params: String,
+      implicits: String,
+      returnType: String,
+      implementation: String
+  ) {
+    def render(effectWrapper: EffectWrapper): String = {
+      val renderedImplicits = if (implicits.isEmpty) "" else s"($implicits)"
+      s"""def $name${params
+        .mkString("(", "", ")")}$renderedImplicits: $returnType =  {
+         |  $implementation
+         |}""".stripMargin
+    }
+  }
+
+  case class CalibanAPI(
+      models: List[CaseClassType2],
+      args: List[CaseClassType2],
+      outputTypes: List[CaseClassType2],
+      federationArgs: List[(Whatever.Table, CaseClassType2)],
+      implicits: List[String], // <- given implicitly really, pun intended
+      queryRoot: CaseClassType2,
+      mutationRoot: CaseClassType2,
+      unreachableTypes: List[GeneratedMethod], // Method
+      entityResolvers: List[GeneratedMethod], // Method
+      extensions: ScalaTrait,
+      extensionArgTypes: List[CaseClassType2],
+      tables: List[Whatever.Table],
+      objectExtensions: List[ObjectExtension]
+  ) {
+    def render(effectWrapper: EffectWrapper): String = {
+      val renderedModels = models.map(_.render(effectWrapper)).mkString("\n")
+      val renderedArgs =
+        args.distinct.map(_.render(effectWrapper)).mkString("\n")
+      val renderedOutputTypes =
+        outputTypes.distinct.map(_.render(effectWrapper)).mkString("\n")
+      val renderedExtensionArgTypes =
+        extensionArgTypes.distinct.map(_.render(effectWrapper)).mkString("\n")
+      val renderedImplicits = implicits.distinct.mkString("\n")
+      val renderedQueryRoot = queryRoot.render(effectWrapper)
+      val renderedMutationRoot = mutationRoot.render(effectWrapper)
+      val renderedUnreachableTypes =
+        s"""object UnreachableTypes {
+           |  ${unreachableTypes.map(_.render(effectWrapper)).mkString("\n")}  
+           |}""".stripMargin
+      val renderedUnreachablTypeInvocations = unreachableTypes
+        .map { tpeCreator =>
+          s"${tpeCreator.name}()"
+        }
+        .mkString("List(", ",", ")")
+
+      val renderedEntityResolvers =
+        s"""object EntityResolvers {
+           |  ${entityResolvers.map(_.render(effectWrapper)).mkString("\n")}
+           |}""".stripMargin
+
+      val renderedExtensionTrait =
+        s"""trait ${extensions.name} {
+           | ${extensions.methods
+          .map(_.renderSignature(effectWrapper))
+          .mkString("\n")}
+           |}""".stripMargin
+
+      val renderedTableList =
+        tables.map(_.renderSelf).mkString("List(", ",", ")")
+
+      val renderedFederationInvocationParams = entityResolvers.map { method =>
+        s"""${method.name}(extensionLogicByType, tables, entityResolverConditionByTypeName, connection)"""
+      } match {
+        case ::(head, next) => s"baseApi,${head}, ${next.mkString(",")}"
+        case Nil            => "baseApi"
+      }
+
+      val renderedExtensionLogicMapEntries = objectExtensions.map { extension =>
+        val extensionInputType =
+          s"${extension.objectName}${extension.field.fieldName}ExtensionArg"
+        val extensionMethodName =
+          s"${extension.objectName}${extension.field.fieldName}"
+        val requiredFields = extension.field.requiredFields
+          .map(reqField => s""""$reqField"""")
+          .mkString(",")
+        s"""ExtensionPosition("${extension.objectName}","${extension.field.fieldName}", List($requiredFields)) -> middleGenericJsonObject[$extensionInputType,${extension.field.tpe.name}](extensions.${extensionMethodName})("${extension.field.fieldName}")"""
+      }
+
+      val renderedInsertByFieldNameEntries = List("")
+      val renderedUpdateByFieldNameEntries = List("")
+      val renderedDeleteByFieldNameEntries = List("")
+
+      val renderedTables = tables
+        .map { table =>
+          s"val ${table.name} = ${table.renderSelf}"
+        }
+        .mkString("\n")
+
+      val renderedEntityResolverConditionsHandlerEntries = federationArgs
+        .map { case (table, primaryKey) =>
+          s""""${table.name}" -> ${table.name}.extractFederatedCondition"""
+        }
+        .mkString(",\n")
+
+      val renderedApiClass =
+        s"""class API(extensions: Extensions, connection: Connection)(implicit val querySchema: Schema[Any, Queries], mutationSchema: Schema[Any, Mutations]) {
+           |   import EntityResolvers._
+           |   import UnreachableTypes._
+           |   val tables = $renderedTableList
+           |
+           |   $renderedTables
+           |
+           |   val extensionLogicByType: ExtensionLogicMap = List(
+           |      ${renderedExtensionLogicMapEntries.mkString(",\n")}
+           |   )
+           |
+           |   val insertByFieldName: Map[String, Json => String] = Map(
+           |      ${renderedInsertByFieldNameEntries.mkString(",\n")}
+           |   )
+           |
+           |   val updateByFieldName: Map[String, Json => String] = Map(
+           |      ${renderedUpdateByFieldNameEntries.mkString(",\n")}
+           |   )
+           |
+           |   val deleteByFieldName: Map[String, Json => String] = Map(
+           |      ${renderedDeleteByFieldNameEntries.mkString(",\n")}
+           |   )
+           |
+           |   val entityResolverConditionByTypeName: Map[String, InputValue => String]= Map(
+           |      $renderedEntityResolverConditionsHandlerEntries
+           |   )
+           |
+           |  val baseApi = new GraphQL[Any] {
+           |    override protected val schemaBuilder: RootSchemaBuilder[Any] = RootSchemaBuilder(
+           |      Option(
+           |        constructQueryOperation[Any,Queries](
+           |          connection,
+           |          extensionLogicByType,
+           |          tables
+           |        )
+           |      ),
+           |      Option(
+           |        constructMutationOperation[Any, Mutations](
+           |          connection,
+           |          extensionLogicByType,
+           |          tables,
+           |          insertByFieldName,
+           |          updateByFieldName,
+           |          deleteByFieldName
+           |        )
+           |      ),
+           |      None
+           |    )
+           |    override protected val wrappers: List[Wrapper[Any]] = Nil
+           |    override protected val additionalDirectives: List[__Directive] = Nil
+           |  }
+           |
+           |    def createApi(
+           |               ): GraphQL[Any] = {
+           |    federate(
+           |      $renderedFederationInvocationParams
+           |    ).withAdditionalTypes(${renderedUnreachablTypeInvocations})
+           |  }
            |}
            |""".stripMargin
 
-    val federationKeys = fields.filter(_.isPrimaryKey).map(_.name)
-
-    val isInput = (isInsertForTable.toList ++ isUpdateForTable.toList ++ isDeleteForTable.toList).nonEmpty
-
-    val federationKeyDirective = if(federationKeys.nonEmpty && isFederationArg.isEmpty && !isInput) s"""@GQLDirective(Key("${federationKeys.mkString(" ")}")) """ else ""
-
-    s"""$federationKeyDirective$caseClassDefinition$extendsClauses$implementation""".stripMargin
+      s"""
+         |${CalibanAPI.imports}
+         |object Definitions {
+         |
+         |  $renderedModels
+         |
+         |  $renderedArgs
+         |
+         |  $renderedOutputTypes
+         |
+         |  $renderedExtensionArgTypes
+         |
+         |
+         |$renderedQueryRoot
+         |
+         |$renderedMutationRoot
+         |
+         |$renderedUnreachableTypes
+         |
+         |$renderedEntityResolvers
+         |
+         |$renderedExtensionTrait
+         |
+         |$renderedApiClass
+         |}
+         |""".stripMargin
+    }
   }
 
-  def renderToInsert(tableName: String): String = {
-    val columnList = fields.filterNot(_.isRelationship).map(_.name)
-    val valueList = fields.filterNot(_.isRelationship).map { field =>
-      val fieldName = "$"+field.name
-      if(field.scalaType.strict().isQuoted) {
-        s"'$fieldName'"
+  object CalibanAPI {
+    val imports =
+      """
+        |import caliban._
+        |import caliban.GraphQL.graphQL
+        |import caliban.execution.Field
+        |import caliban.schema.{ArgBuilder, GenericSchema}
+        |import caliban.schema.Schema.gen
+        |import caliban.schema._
+        |import caliban.schema.Annotations.GQLDirective
+        |import caliban.InputValue.ObjectValue
+        |import caliban.InputValue
+        |import caliban.federation._
+        |import caliban.introspection.adt.{__Directive, __Type}
+        |import caliban.wrappers.Wrapper
+        |import caliban.parsing.adt.Type
+        |import generic._
+        |import zio.ZIO
+        |import zio.NonEmptyChunk
+        |import zio.query.ZQuery
+        |import generic.Util._
+        |import io.circe.Json
+        |import io.circe.generic.auto._, io.circe.syntax._
+        |import codegen.Whatever._
+        |import codegen.{Column, ExportedKeyInfo}
+        |import codegen.Version2._
+        |import java.sql.Connection
+        |
+        |import java.time.ZonedDateTime
+        |import java.util.UUID
+        |""".stripMargin
+  }
+
+  case class GeneratedTypes(
+      models: List[CaseClassType2],
+      args: List[(String, CaseClassType2)],
+      outputTypes: List[CaseClassType2],
+      queryFields: List[Field2],
+      mutationFields: List[Field2],
+      entityResolvers: List[GeneratedMethod],
+      extensionTraitMethods: List[Method2],
+      entityResolverKeys: List[(Whatever.Table, CaseClassType2)]
+  )
+
+  // FIXME: Filter omitted tables before calling this method
+  def toCalibanAPI(
+      tables: List[Whatever.Table],
+      externalExtensions: List[ObjectExtension]
+  ): CalibanAPI = {
+
+    val generatedTypes = tables
+      .map { table =>
+        // TODO: Name annotations
+
+        val modelType = table match {
+          case c: Whatever.PrimaryKeyTable     => c.toModel(tables)
+          case c2: Whatever.NonPrimaryKeyTable => c2.toModel(tables)
+        }
+
+        val createFields = List(table.toCreateField(tables))
+        val updateFields = Nil
+        val deleteFields = Nil
+        val mutationFields = createFields ++ updateFields ++ deleteFields
+
+        val extensionMethods = table.toExtensionMethods()
+
+        table match {
+          case prim: Whatever.PrimaryKeyTable =>
+            val queryFields = List(
+              Field2(
+                s"get${modelType.name}ById",
+                AbstractEffect(ScalaOption(modelType)),
+                Nil,
+                prim.getByIdParams()
+              ),
+              Field2(
+                s"list${modelType.name}",
+                AbstractEffect(ScalaList(modelType)),
+                Nil,
+                List(prim.toPaginationParams())
+              )
+              //TODO: Add more here, possibly based on annotations
+            )
+
+            GeneratedTypes(
+              models = List(modelType),
+              args = Nil,
+              outputTypes = Nil,
+              queryFields = queryFields,
+              mutationFields = mutationFields,
+              entityResolvers =
+                List(createEntityHandlerMethod(modelType)), // TODO: FIX
+              extensionTraitMethods = extensionMethods,
+              entityResolverKeys = List((table, prim.toPk()))
+            )
+          case noPrim: Whatever.NonPrimaryKeyTable =>
+            GeneratedTypes(
+              models = List(modelType),
+              args = Nil,
+              outputTypes = Nil,
+              queryFields = Nil,
+              mutationFields = mutationFields,
+              entityResolvers = Nil,
+              extensionTraitMethods = extensionMethods,
+              entityResolverKeys = Nil
+            )
+        }
+      }
+
+    val queryRoot =
+      CaseClassType2("Queries", generatedTypes.flatMap(_.queryFields), Nil, Nil)
+
+    val mutationRoot =
+      CaseClassType2(
+        "Mutations",
+        generatedTypes.flatMap(_.mutationFields),
+        Nil,
+        Nil
+      )
+
+    // Fill up the global typemap
+    tables.map {
+      case table @ (prim: Whatever.PrimaryKeyTable) =>
+        globalTypeMap.put(table.name, prim.toModel(tables))
+      case table @ (noPrim: Whatever.NonPrimaryKeyTable) =>
+        globalTypeMap.put(table.name, noPrim.toModel(tables))
+    }
+
+    val args = tables.flatMap { table =>
+      table.extractArgTypes
+    }
+
+    val outputTypes =
+      Nil //TODO: Add these later when we implement more complicated ops
+
+    val extensionArgTypes = tables.flatMap { table =>
+      table.extractExtensionArgTypes()
+    }
+
+    val unreachableTypeMethods = externalExtensions
+      .map(_.field.tpe)
+      .filter(needsSchema)
+      .filterNot(tpe => globalTypeMap.values.exists(v => v == tpe))
+      .map(tpe =>
+        //def create${typeName}Schema()(implicit schema: Schema[Any, ${typeName}]) : __Type = schema.toType_()"
+        Version2.GeneratedMethod(
+          s"create${tpe.name}Schema",
+          "",
+          s"schema: Schema[Any, ${tpe.name}]",
+          "__Type",
+          "schema.toType_()"
+        )
+      )
+
+    val extensionTrait = ScalaTrait(
+      "Extensions",
+      generatedTypes.flatMap(_.extensionTraitMethods)
+    )
+    val schemaImplicits =
+      (generatedTypes.flatMap(_.models) ++ args ++ outputTypes).map { tpe =>
+        s"implicit val ${tpe.name}Schema = Schema.gen[${tpe.name}]"
+      }
+
+    val argbuilderImplicits = args.map { argTpe =>
+      s"implicit val ${argTpe.name}ArgBuilder = ArgBuilder.gen[${argTpe.name}]"
+    }
+
+    CalibanAPI(
+      models = generatedTypes.flatMap(_.models),
+      args = args,
+      outputTypes = outputTypes,
+      implicits = schemaImplicits ++ argbuilderImplicits,
+      queryRoot = queryRoot,
+      mutationRoot = mutationRoot,
+      unreachableTypes = unreachableTypeMethods,
+      entityResolvers = generatedTypes.flatMap(_.entityResolvers),
+      extensions = extensionTrait,
+      extensionArgTypes = extensionArgTypes,
+      federationArgs = generatedTypes.flatMap(_.entityResolverKeys),
+      tables = tables,
+      objectExtensions = externalExtensions
+    )
+  }
+
+  def needsSchema(tpe: ScalaType): Boolean = {
+    tpe match {
+      case baseType: BaseType => false
+      case containerType: ContainerType =>
+        containerType match {
+          case ScalaOption(inner)    => needsSchema(inner)
+          case ScalaList(inner)      => needsSchema(inner)
+          case AbstractEffect(inner) => needsSchema(inner)
+        }
+      case CaseClassType2(name, fields, annotations, extendsClauses) => true
+      case TypeReference(tpe)                                        => needsSchema(tpe())
+    }
+  }
+
+  def createEntityHandlerMethod(
+      modelType: CaseClassType2
+  ): GeneratedMethod = {
+    val params =
+      "extensions: ExtensionLogicMap, tables: List[Table], conditionsHandlerMap: Map[String, InputValue => String], connection: Connection"
+    val impl = """new EntityResolver[Any] {
+      |    override def resolve(value: InputValue): ZQuery[Any, CalibanError, Step[Any]] = genericEntityHandler(extensions, tables, conditionsHandlerMap, connection)(value)
+      |    override def toType: __Type = schema.toType_()
+      |}""".stripMargin
+
+    GeneratedMethod(
+      s"create${modelType.name}EntityResolver",
+      params,
+      s"implicit schema: Schema[Any,${modelType.name}]",
+      "EntityResolver[Any]",
+      impl
+    )
+  }
+
+  def createRelationshipFields2(
+      table: Whatever.Table,
+      tables: List[Whatever.Table]
+  ): List[Field2] = {
+    println(s"CREATING RELATIONSHIPS FOR ${table.name}")
+    //TODO: Disregard omitted tables
+    val tableColumnTables = table.tableColumns
+
+    table.relationships.map { link =>
+      if (link.pkTableName == table.name) {
+        // Some other table references this table
+        // Options are -> Option["other-type"], List["other-type"]
+
+        // "other-type" cant occur. We are the primary
+        // Option["other-type"] can occur. Our reference is unique and their reference is unique
+        // List["other-type"] can occur. Our reference is non-unique or their reference is non-unique
+        val otherTableName =
+          if (link.pkTableName == table.name) link.fkTableName
+          else link.pkTableName
+
+        val thisTableReferenceName =
+          if (link.pkTableName == table.name) link.pkColumnName
+          else link.fkColumnName
+        val thatTableReferenceName =
+          if (link.pkTableName == table.name) link.fkColumnName
+          else link.pkColumnName
+
+        val thisTableReferenceUnique = table.tableColumns
+          .find(_.name == thisTableReferenceName)
+          .map(_.unique)
+          .getOrElse(
+            throw new RuntimeException(
+              s"Unable to find column ${thisTableReferenceName} mentioned in $link"
+            )
+          )
+        val thatTable = tables
+          .find(_.name == otherTableName)
+          .getOrElse(
+            throw new RuntimeException(
+              s"Unable to find table $otherTableName mentioned in ${link}"
+            )
+          )
+        val thatTableReferenceUnique =
+          thatTable.tableColumns
+            .find(_.name == thatTableReferenceName)
+            .map(_.unique)
+            .getOrElse(
+              throw new RuntimeException(
+                s"Unable to find column ${thatTableReferenceName} mentioned in $link"
+              )
+            )
+        val (linkType, params) =
+          if (thisTableReferenceUnique && thatTableReferenceUnique)
+            (() => ScalaOption(globalTypeMap(otherTableName)), Nil)
+          else {
+            (
+              () => ScalaList(globalTypeMap(otherTableName)),
+              List(thatTable.toPaginationParams)
+            )
+          }
+        val fieldName =
+          if (tableColumnTables.exists(_.name.contentEquals(otherTableName)))
+            s"${otherTableName}_ref"
+          else otherTableName
+        Field2(
+          fieldName,
+          AbstractEffect(TypeReference(linkType)),
+          Nil,
+          params
+        )
       } else {
-        fieldName
+        // This table is foreign key, we are linking to some other table
+
+        val otherTableName =
+          if (link.pkTableName == table.name) link.fkTableName
+          else link.pkTableName
+        val thisTableReferenceName =
+          if (link.pkTableName == table.name) link.pkColumnName
+          else link.fkColumnName
+        val thatTableReferenceName =
+          if (link.pkTableName == table.name) link.fkColumnName
+          else link.pkColumnName
+
+        val thisTableReferenceNullable =
+          table.tableColumns
+            .find(_.name.contentEquals(thisTableReferenceName))
+            .map(_.nullable)
+            .getOrElse(
+              throw new RuntimeException(
+                s"Unable to find column ${thisTableReferenceName} in table ${table.name} mentioned in $link"
+              )
+            )
+        val thatTable = tables
+          .find(_.matchesName(otherTableName))
+          .getOrElse(
+            throw new RuntimeException(
+              s"Unable to find table $otherTableName mentioned in ${link}"
+            )
+          )
+        val thatTableReferenceUnique =
+          thatTable.tableColumns
+            .find(_.name.contentEquals(thatTableReferenceName))
+            .map(_.unique)
+            .getOrElse(
+              throw new RuntimeException(
+                s"Unable to find column ${thatTableReferenceName} in table ${table.name} mentioned in $link"
+              )
+            )
+
+        // For "other-type" to occur our reference must be non-nullable and their reference must be unique
+        // for Option["other-type"] to occur our reference must be nullable and their reference must be unique
+        // for List["other-type"] to occur our reference must be nullable and their reference must not be unique
+        // for NonEmptyList["other-type"] to occur our reference be non-nullable and their reference must not non unique
+        // if this tables reference column is non-nullable AND that tables reference column is unique THEN "other-type"
+        // if this tables reference column is nullable AND that tables reference column is unique THEN Option["other-type"]
+        // if this tables reference column is nullable AND that tables reference column is not unique THEN List["other-type"]
+        // if this tables reference column is non-nullable AND that tables reference column is not unique THEN NonEmptyList["other-type"]
+        val otherTableModelType = () => globalTypeMap(otherTableName)
+        val (linkType, params) =
+          (thisTableReferenceNullable, thatTableReferenceUnique) match {
+            case (true, true) =>
+              (ScalaOption(TypeReference(otherTableModelType)), Nil)
+            case (true, false) =>
+              (
+                ScalaList(TypeReference(otherTableModelType)),
+                List(thatTable.toPaginationParams)
+              )
+            case (false, false) =>
+              (
+                ScalaList(TypeReference(otherTableModelType)),
+                List(thatTable.toPaginationParams)
+              ) // Could refine to non-empty list
+            case (false, true) => (TypeReference(otherTableModelType), Nil)
+          }
+        val fieldName =
+          if (tableColumnTables.exists(_.name.contentEquals(otherTableName)))
+            s"${otherTableName}_ref"
+          else otherTableName
+        Field2(
+          fieldName,
+          AbstractEffect(linkType),
+          Nil,
+          params
+        )
       }
     }
-    "s\""++s"insert into ${tableName}(${columnList.mkString(",")}) values (${valueList.mkString(",")})" ++ "\""
-  }
-
-  def renderToUpdate(tableName: String): String = "???"
-  def renderToDelete(tableName: String): String = "???"
-
-  def renderFederationArg(): String = {
-    val predicates = fields.map {field =>
-      val fieldName = "$"+field.name
-        if(field.scalaType.strict().isQuoted) s"${field.name} = '$fieldName'"
-        else s"${field.name} = $fieldName"
-    }.mkString(" AND ")
-
-    "s\"" ++ predicates ++ "\""
-  }
-
-  override def isQuoted: Boolean = false
-
-  override def to__Type: __Type = {
-    val f = fields.map { field =>
-      val directives = if(field.isExternal) List(federation.External) else List()
-      __Field(field.name, None, Nil, () => field.scalaType.strict().to__Type, false, None, Option(directives))
-    }
-
-    val directives = externalKeys.map(keys => List(federation.External, federation.Key(keys))).getOrElse(Nil)
-    Types.makeObject(Option(name), None, f, directives,None)
   }
 }
 
-
-case class FunctionArg(name: String, tpe: ScalaType)
-
-case class FunctionType(name: String, args: List[FunctionArg], returnType: ScalaType)
-
-case class TableAPI(
-                     caseClass: CaseClassType,
-                     update: Option[FunctionType],
-                     updateMany: Option[FunctionType],
-                     insert: Option[FunctionType],
-                     insertMany: Option[FunctionType],
-                     delete: Option[FunctionType],
-                     deleteMany: Option[FunctionType],
-                     getById: Option[FunctionType],
-                     getGeneric: List[FunctionType]
-                   )
-
 object Util {
 
-  def typeTo__Type(tpe: Type): __Type = {
-    tpe match {
-      case Type.NamedType(name, nonNull) =>
-        val inner = name match {
-          case "String" => Types.string
-          case "Int" => Types.int
-          case "Boolean" => Types.boolean
-          case "Long" => Types.long
-          case "Float" => Types.float
-          case "Double" => Types.double
-          case str => typeMap(str).to__Type
-        }
-        if(nonNull) Types.makeNonNull(inner) else inner
-      case Type.ListType(ofType, nonNull) => Types.makeList(typeTo__Type(ofType))
-    }
-  }
-
-  def typeToScalaType(tpe: Type, alreadyWrapped: Boolean = false, external: Boolean): ScalaType = {
+  def typeToScalaTypeV2(
+      tpe: Type,
+      alreadyWrapped: Boolean = false,
+      external: Boolean
+  ): Version2.ScalaType = {
     tpe match {
       case Type.NamedType(name, nonNull) =>
         val base = name match {
-          case "String" => StringType
-          case "Int" => IntegerType
-          case "ID" => if(external) StringType else UUIDType
-          case other => typeMap(other)
+          case "String" => ScalaString
+          case "Int"    => ScalaInt
+          case "ID"     => if (external) ScalaString else ScalaUUID
+          case other    => Version2.globalTypeMap(other)
         }
-        if(!alreadyWrapped && !nonNull) {
-          OptionType(base)
+        if (!alreadyWrapped && !nonNull) {
+          ScalaOption(base)
         } else {
           base
         }
 
-      case Type.ListType(ofType, nonNull) => ListType(typeToScalaType(ofType, alreadyWrapped = true, external = external))
-    }
-  }
-
-  def objectExtensionFieldToField(extension: ObjectExtensionField): __Field = {
-    __Field(extension.fieldName, None, Nil, () => extension.fieldType.to__Type, false, None, None)
-  }
-
-  def checkExtensionApplies(tpe: __Type, extension :ObjectExtension): Boolean =  {
-    val name = Util.extractTypeName(tpe)
-
-    if(name.contentEquals(extension.objectName)) {
-      true
-    } else {
-      false
-    }
-  }
-
-  def extendType(tpe: __Type, extensions: List[ObjectExtension]): __Type = {
-    tpe.kind match {
-      case __TypeKind.SCALAR | __TypeKind.INTERFACE | __TypeKind.UNION | __TypeKind.ENUM  | __TypeKind.INPUT_OBJECT => tpe
-      case __TypeKind.OBJECT =>
-        val extensionsToApply = extensions.filter(extension => checkExtensionApplies(tpe, extension)).map(_.field)
-        extensionsToApply match {
-          case Nil =>
-            def computeFields(a: __DeprecatedArgs): Option[List[__Field]] = {
-              val patchedFields = tpe.fields(a).getOrElse(Nil).map { field =>
-                field.copy(`type` = () => extendType(field.`type`(), extensions))
-              }
-              Option(patchedFields)
-            }
-            tpe.copy(fields = computeFields)
-          case list =>
-            def computeFields(a: __DeprecatedArgs): Option[List[__Field]] = {
-              val patchedFields = tpe.fields(a).getOrElse(Nil).map { field =>
-                field.copy(`type` = () => extendType(field.`type`(), extensions))
-              }
-
-              Option(patchedFields ++ list.map(objectExtensionFieldToField))
-            }
-            tpe.copy(fields = computeFields)
-        }
-      case __TypeKind.LIST | __TypeKind.NON_NULL  =>
-        tpe.copy(ofType = tpe.ofType.map(extendType(_, extensions)))
+      case Type.ListType(ofType, nonNull) =>
+        ScalaList(
+          typeToScalaTypeV2(ofType, alreadyWrapped = true, external = external)
+        )
     }
   }
 
   def extractTypeName(tpe: __Type): String = {
     tpe.name match {
       case Some(value) => value
-      case None => tpe.ofType match {
-        case Some(value) => extractTypeName(value)
-        case None => throw new RuntimeException("Should never happen")
-      }
-    }
-  }
-
-  def checkObjectMatches(field: CField, extension: ObjectExtension): Boolean = {
-
-    val typeName = extractTypeName(field.fieldType)
-
-    val res = typeName.contentEquals(extension.objectName) && field.fields.exists(_.name.contentEquals(extension.field.fieldName))
-    println(s"CHECK MATCHES OBJECT $typeName = ${extension.objectName} -> $res")
-    res
-  }
-
-  def includesArray(tpe: __Type): Boolean =  {
-    tpe.kind match {
-      case __TypeKind.SCALAR => false
-      case __TypeKind.OBJECT => false
-      case __TypeKind.INTERFACE => false
-      case __TypeKind.UNION =>false
-      case __TypeKind.ENUM =>false
-      case __TypeKind.INPUT_OBJECT =>false
-      case __TypeKind.LIST => true
-      case __TypeKind.NON_NULL =>
-        includesArray(tpe.ofType.getOrElse(throw new RuntimeException("Expected NON_NULL to have inner type")))
-    }
-  }
-
-
-  def createModification(transformer: JsonObject => ZIO[Any, Nothing, JsonObject], path: List[JsonPathPart]): Json => ZIO[Any,Nothing, Json] = {
-    import zio.interop.catz._
-    import zio.interop.catz.implicits._
-
-    path.foldLeft[PathWrapper](ObejctPathWrapper(root)) { (acc, next) =>
-      next match {
-        case ArrayPath => acc match {
-          case ObejctPathWrapper(path) => ArrayPathWrapper(path.each)
-          case ArrayPathWrapper(path) => ArrayPathWrapper(path.each)
+      case None =>
+        tpe.ofType match {
+          case Some(value) => extractTypeName(value)
+          case None        => throw new RuntimeException("Should never happen")
         }
-        case ObjectPath(fieldName, typeTest) => acc match {
-          case ObejctPathWrapper(path) => ObejctPathWrapper(path.selectDynamic(fieldName))
-          case ArrayPathWrapper(path) => ArrayPathWrapper(path.selectDynamic(fieldName))
-        }
-      }
-    } match {
-      case ObejctPathWrapper(path) => path.obj.modifyF(transformer)
-      case ArrayPathWrapper(path) =>path.obj.modifyF(transformer)
     }
-  }
-
-  def argToWhereClause(key: String, value: InputValue): String = {
-    value match {
-      case InputValue.ListValue(values) => s"$key in [] " //TODO
-      case InputValue.ObjectValue(fields) => "" //TODO
-      case InputValue.VariableValue(name) => "" //TODO
-      case value: Value => value match {
-        case Value.NullValue => ""
-        case value: Value.IntValue => s"$key = ${value}"
-        case value: Value.FloatValue => s"$key = $value"
-        case Value.StringValue(value) => s"$key = '${value}'"
-        case Value.BooleanValue(value) => s"$key = $value"
-        case Value.EnumValue(value) => s"$key = '$value'"
-      }
-    }
-  }
-
-  // Generic, straight copy
-  def toIntermediateFromReprQuery(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition]): Intermediate = {
-    println(s"toIntermediateFromReprQuery: ${field.name}")
-    // Top level entity query
-    if(field.name.contentEquals("_entities")) {
-      val tableName = field.fields.headOption.flatMap(_.parentType).flatMap(_.name).getOrElse(throw new RuntimeException("Unable to find table name for _entities request"))
-      val table = tables.find(_.name.contentEquals(tableName.mkString(""))).getOrElse(throw new RuntimeException(s"Unable to find table for ${tableName.mkString("")}"))
-      val extensionColumnsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
-      val (queriedCols, recurseCases) = field.fields.partition(_.fields.isEmpty) // TODO: Do dependency analysis
-      val extensionsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
-      val requirementsFromExtensions = extensionsForThisTable.flatMap(_.requirements)
-      // SELECT: id, name
-      // FROM tablename
-      val recursiveCases = recurseCases
-        .filterNot(field => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(field.name))) // Don't recurse on extension columns
-        .map(f =>
-          toIntermediate(f, tables, s"${layerName}.${f.name}", extensions)
-        )
-        .map { otherTable =>
-          table.relationships
-            .find { relationshipTable => relationshipTable.pkTableName == table.name && relationshipTable.fkTableName == otherTable.from.tableName }
-            .map(link => IntermediateJoin(link.pkColumnName, link.fkColumnName, otherTable, "TODO"))
-            .orElse(table.relationships
-              .find { relationshipTable =>
-                relationshipTable.fkTableName == table.name && relationshipTable.pkTableName == otherTable.from.tableName
-              }
-              .map(link => IntermediateJoin(link.fkColumnName, link.pkColumnName, otherTable, "TODO"))
-            )
-            .getOrElse(throw new RuntimeException(s"Unable to find link between ${table.name} and ${otherTable.from.tableName} required by ${field}"))
-        }
-
-      println(s"TABLE $tableName ")
-      println(s"COLS: ${queriedCols.map(_.name)}")
-      println(s"COL AND DIRS: ${queriedCols.map(col => col.name -> col.directives.map(_.name))}")
-
-
-      val cols = (queriedCols
-        .filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name)) ++ requirementsFromExtensions // Dont select extension columns, but do select the extensions requirements
-
-      Intermediate(
-        cols,
-        IntermediateFrom(table.name, recursiveCases),
-        field
-          .copy(fieldType = field.fieldType.copy(kind = __TypeKind.OBJECT)) // TODO: Annoying hack needed to "cast" the output to an object due to calibans weird handling of entityresolvers
-      )
-    } else {
-      toIntermediate(field, tables, layerName, extensions)
-    }
-  }
-
-  def toIntermediate(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition]): Intermediate = {
-    println(s"toIntermediate: ${field.name}")
-    val tableName = field.fieldType.ofType match {
-      case Some(value) => compileOfType(value)
-      case None => List(field.fieldType.name.getOrElse(throw new RuntimeException(s"No typename for field ${field}")))
-    }
-
-    val table = tables.find(_.name.contentEquals(tableName.mkString(""))).getOrElse(throw new RuntimeException(s"Unable to find table for ${tableName.mkString("")}"))
-    val extensionColumnsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
-    val (queriedCols, recurseCases) = field.fields.filterNot(_.name.contentEquals("__typename")).partition(_.fields.isEmpty) // TODO: Do dependency analysis
-    val extensionsForThisTable = extensions.filter(_.objectName.contentEquals(table.name))
-    val requirementsFromExtensions = extensionsForThisTable.flatMap(_.requirements)
-    // SELECT: id, name
-    // FROM tablename
-    val recursiveCases = recurseCases.filterNot(field => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(field.name)))
-      .map(f =>
-        toIntermediate(f, tables, s"${layerName}.${f.name}", extensions)
-      )
-      .map { otherTable =>
-        table.relationships
-          .find { relationshipTable => relationshipTable.pkTableName == table.name && relationshipTable.fkTableName == otherTable.from.tableName }
-          .map(link => IntermediateJoin(link.pkColumnName, link.fkColumnName, otherTable, "TODO"))
-          .orElse(table.relationships
-            .find { relationshipTable =>
-              relationshipTable.fkTableName == table.name && relationshipTable.pkTableName == otherTable.from.tableName
-            }
-            .map(link => IntermediateJoin(link.fkColumnName, link.pkColumnName, otherTable, "TODO"))
-          )
-          .getOrElse(throw new RuntimeException(s"Unable to find link between ${table.name} and ${otherTable.from.tableName} required by ${field}"))
-      }
-
-    println(s"TABLE $tableName ")
-    println(s"COLS: ${queriedCols.map(_.name)}")
-    println(s"COL AND DIRS: ${queriedCols.map(col => col.name -> col.directives.map(_.name))}")
-
-
-
-    Intermediate((queriedCols.filterNot(col => extensionColumnsForThisTable.map(_.fieldName).exists(_.contentEquals(col.name))).map(_.name) ++ requirementsFromExtensions).distinct, IntermediateFrom(table.name, recursiveCases), field)
   }
 
   def extractUnwrappedTypename(tpe: __Type): String = {
     tpe.kind match {
-      case __TypeKind.SCALAR => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
-      case __TypeKind.OBJECT => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
-      case __TypeKind.INTERFACE => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
-      case __TypeKind.UNION => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
-      case __TypeKind.ENUM => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
-      case __TypeKind.INPUT_OBJECT => tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
-      case __TypeKind.LIST => extractUnwrappedTypename(tpe.ofType.getOrElse(throw new RuntimeException("Should never happen")))
-      case __TypeKind.NON_NULL => extractUnwrappedTypename(tpe.ofType.getOrElse(throw new RuntimeException("Should never happen")))
+      case __TypeKind.SCALAR =>
+        tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.OBJECT =>
+        tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.INTERFACE =>
+        tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.UNION =>
+        tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.ENUM =>
+        tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.INPUT_OBJECT =>
+        tpe.name.getOrElse(throw new RuntimeException("Should never happen"))
+      case __TypeKind.LIST =>
+        extractUnwrappedTypename(
+          tpe.ofType.getOrElse(
+            throw new RuntimeException("Should never happen")
+          )
+        )
+      case __TypeKind.NON_NULL =>
+        extractUnwrappedTypename(
+          tpe.ofType.getOrElse(
+            throw new RuntimeException("Should never happen")
+          )
+        )
     }
   }
 
-  def findTableFromFieldType(fieldType: __Type, tables: List[Table]): Table = {
+  def findTableFromFieldTypeV2(
+      fieldType: __Type,
+      tables: List[Whatever.Table]
+  ): Whatever.Table = {
     val unwrappedTypename = extractUnwrappedTypename(fieldType)
-    tables.find(_.matchesName(unwrappedTypename)).getOrElse(throw new RuntimeException(s"Unable to find table $unwrappedTypename from type"))
+    tables
+      .find(_.matchesName(unwrappedTypename))
+      .getOrElse(
+        throw new RuntimeException(
+          s"Unable to find table $unwrappedTypename from type"
+        )
+      )
   }
 
-  def findTableFromFieldTypeReprQuery(field: CField, tables: List[Table]): Table = {
-    val tableName = field.fields.headOption.flatMap(_.parentType).flatMap(_.name).getOrElse(throw new RuntimeException("Unable to find table name for _entities request"))
-    tables.find(_.matchesName(tableName)).getOrElse(throw new RuntimeException(s"Unable to find table $tableName from type"))
+  def findTableFromFieldTypeReprQueryV2(
+      field: CField,
+      tables: List[Whatever.Table]
+  ): Whatever.Table = {
+    val tableName = field.fields.headOption
+      .flatMap(_.parentType)
+      .flatMap(_.name)
+      .getOrElse(
+        throw new RuntimeException(
+          "Unable to find table name for _entities request"
+        )
+      )
+    tables
+      .find(_.matchesName(tableName))
+      .getOrElse(
+        throw new RuntimeException(s"Unable to find table $tableName from type")
+      )
   }
 
-  def fieldToSQLResponseType(fieldType: __Type, nullable: Boolean): SQLResponseType = {
+  def fieldToSQLResponseType(
+      fieldType: __Type,
+      nullable: Boolean
+  ): SQLResponseType = {
     fieldType.kind match {
-      case __TypeKind.SCALAR => ???
-      case __TypeKind.OBJECT  => ObjectResponse
-      case __TypeKind.INTERFACE => ObjectResponse
-      case __TypeKind.UNION => ObjectResponse
-      case __TypeKind.ENUM => ???
+      case __TypeKind.SCALAR       => ???
+      case __TypeKind.OBJECT       => ObjectResponse
+      case __TypeKind.INTERFACE    => ObjectResponse
+      case __TypeKind.UNION        => ObjectResponse
+      case __TypeKind.ENUM         => ???
       case __TypeKind.INPUT_OBJECT => ???
-      case __TypeKind.LIST => ListResponse
-      case __TypeKind.NON_NULL => fieldToSQLResponseType(fieldType.ofType.getOrElse(throw new RuntimeException("Should never happen")), false)
+      case __TypeKind.LIST         => ListResponse
+      case __TypeKind.NON_NULL =>
+        fieldToSQLResponseType(
+          fieldType.ofType.getOrElse(
+            throw new RuntimeException("Should never happen")
+          ),
+          false
+        )
     }
-  }
-
-  def extractOrdering(field: CField): Option[String] = {
-    //TODO
-    None
-  }
-
-  def extractCondition(field: CField): Option[String] = {
-    //TODO
-    None
   }
 
   def matchesTypenameQuery(field: CField): Boolean = {
     field.name.contentEquals("__typename")
   }
 
-  def toIntermediateV2(field: CField, tables: List[Table], layerName: String, extensions: List[ExtensionPosition], rootLevelOfEntityResolver: Boolean = false): IntermediateV2 = {
+  def toIntermediateV2v2(
+      field: CField,
+      tables: List[Whatever.Table],
+      fieldName: String,
+      extensions: List[ExtensionPosition],
+      rootLevelOfEntityResolver: Boolean = false,
+      whereClauses: List[String]
+  ): IntermediateV2 = {
     // Find the table
     val table =
-      if(rootLevelOfEntityResolver) findTableFromFieldTypeReprQuery(field, tables)
-      else findTableFromFieldType(field.fieldType, tables)
+      if (rootLevelOfEntityResolver)
+        findTableFromFieldTypeReprQueryV2(field, tables)
+      else findTableFromFieldTypeV2(field.fieldType, tables)
     // Remove extension fields and __typename fields
     val sqlFields = field.fields
       .filterNot(matchesTypenameQuery)
@@ -753,11 +1752,46 @@ object Util {
     // Find the columns we fetch from this table
     // Find the recursive cases
     val (tableFields, recursiveFields) = sqlFields
-      .partition(field => (table.primaryKeys++table.otherColumns).exists(_.matchesName(field.name)))
+      .partition(field => table.tableColumns.exists(_.matchesName(field.name)))
 
     // Recurse on the recursive cases (joins)
     val joins = recursiveFields
-      .map(field => (toIntermediateV2(field, tables, s"${layerName}.${field.name}", extensions), field))
+      .map { recursiveField =>
+        val otherTableName =
+          findTableFromFieldTypeReprQueryV2(recursiveField, tables).name
+        val (leftCol, rightCol) = table.relationships
+          .find { relationshipTable =>
+            relationshipTable.pkTableName == table.name && relationshipTable.fkTableName == otherTableName
+          }
+          .map(link => (link.pkColumnName, link.fkColumnName))
+          .orElse(
+            table.relationships
+              .find { relationshipTable =>
+                relationshipTable.fkTableName == table.name && relationshipTable.pkTableName == otherTableName
+              }
+              .map(link => (link.fkColumnName, link.pkColumnName))
+          )
+          .getOrElse(
+            throw new RuntimeException(
+              s"Unable to find link between ${table.name} and ${otherTableName} required by ${field}"
+            )
+          )
+
+        val whereClause =
+          List(s""""${fieldName}_data"."$leftCol" = "$rightCol" """)
+        //"dataId"."joinleftcol" = "joinrightcol"
+        (
+          toIntermediateV2v2(
+            recursiveField,
+            tables,
+            s"${fieldName}.${recursiveField.name}",
+            extensions,
+            false,
+            whereClause
+          ),
+          recursiveField
+        )
+      }
       .map { case (otherTable, field) =>
         val otherTableName = otherTable.from.tableName
 
@@ -765,37 +1799,123 @@ object Util {
         // First check if this table is the primary key table
         // Then check if this table is the foreign key table
         table.relationships
-          .find { relationshipTable => relationshipTable.pkTableName == table.name && relationshipTable.fkTableName == otherTableName }
-          .map(link => IntermediateJoinV2(link.pkColumnName, link.fkColumnName, otherTable, otherTableName))
-          .orElse(table.relationships
-            .find { relationshipTable => relationshipTable.fkTableName == table.name && relationshipTable.pkTableName == otherTableName}
-            .map(link => IntermediateJoinV2(link.fkColumnName, link.pkColumnName, otherTable, otherTableName))
+          .find { relationshipTable =>
+            relationshipTable.pkTableName == table.name && relationshipTable.fkTableName == otherTableName
+          }
+          .map(link =>
+            IntermediateJoinV2(
+              link.pkColumnName,
+              link.fkColumnName,
+              otherTable,
+              otherTableName
+            )
           )
-          .getOrElse(throw new RuntimeException(s"Unable to find link between ${table.name} and ${otherTable} required by ${field}"))
+          .orElse(
+            table.relationships
+              .find { relationshipTable =>
+                relationshipTable.fkTableName == table.name && relationshipTable.pkTableName == otherTableName
+              }
+              .map(link =>
+                IntermediateJoinV2(
+                  link.fkColumnName,
+                  link.pkColumnName,
+                  otherTable,
+                  otherTableName
+                )
+              )
+          )
+          .getOrElse(
+            throw new RuntimeException(
+              s"Unable to find link between ${table.name} and ${otherTable} required by ${field}"
+            )
+          )
       }
 
     // Fetch any columns the extensions depend on
-    val usedExtensions = extensions.filter(extension => extension.objectName.contentEquals(table.name) && field.fields.exists(_.name.contentEquals(extension.fieldName)))
-    val requirementsFromExtensions = usedExtensions.flatMap(_.requirements)
+    val usedExtensions = table.objectExtensions.filter(extension =>
+      field.fields.exists(_.name.contentEquals(extension.field.fieldName))
+    )
+    val requirementsFromExtensions =
+      usedExtensions.flatMap(v => v.field.requiredFields)
     // Caliban federation handling is weird
-    val responseType = if(rootLevelOfEntityResolver) ObjectResponse else fieldToSQLResponseType(field.fieldType, nullable = true)
-    val ordering = extractOrdering(field)
-    val condition = extractCondition(field)
+    val responseType =
+      if (rootLevelOfEntityResolver) ObjectResponse
+      else fieldToSQLResponseType(field.fieldType, nullable = true)
+    val ordering = None
+    val condition =
+      if (rootLevelOfEntityResolver) None
+      else
+        responseType match {
+          case ObjectResponse =>
+            table match {
+              case prim: Whatever.PrimaryKeyTable =>
+                Option(prim.extractSingleItemCondition(field))
+              case noPrim: Whatever.NonPrimaryKeyTable =>
+                None // Should this ever happen? How do we select a single row from a table without a primary key
+            }
+          case ListResponse => Option(table.extractPaginationSizing(field))
+        }
+    println(s"COndition: $condition. ResponseType: $responseType")
 
-    val requirementsColumns = requirementsFromExtensions.map(requiredField => IntermediateColumn(requiredField, requiredField))
+    val requirementsColumns = requirementsFromExtensions.map(requiredField =>
+      IntermediateColumn(requiredField, requiredField)
+    )
     val tableColumns = tableFields
-      .map(field => field -> (table.primaryKeys ++ table.otherColumns).find(_.matchesName(field.name)))
-      .map{case (field, column) => IntermediateColumn(column.getOrElse(throw new RuntimeException("Should never happen")).name, field.alias.getOrElse(field.name))}
+      .map(field => field -> table.tableColumns.find(_.matchesName(field.name)))
+      .map { case (field, column) =>
+        IntermediateColumn(
+          column
+            .getOrElse(throw new RuntimeException("Should never happen"))
+            .name,
+          field.alias.getOrElse(field.name)
+        )
+      }
 
-    IntermediateV2Regular(requirementsColumns ++ tableColumns, IntermediateFromV2(table.name, joins),responseType, condition, ordering)
+    val pagination = responseType match {
+      case ObjectResponse => None
+      case ListResponse => Option(table.extractPaginationSizing(field))
+    }
 
+    val whereClauseFromField = responseType match {
+      case ObjectResponse => table match {
+        case prim: Whatever.PrimaryKeyTable => Option(prim.extractSingleItemCondition(field))
+        case nonPrim: Whatever.NonPrimaryKeyTable => None
+      }
+      case ListResponse => None
+    }
+
+    IntermediateV2Regular(
+      requirementsColumns ++ tableColumns,
+      IntermediateFromV2(table.name, joins),
+      responseType,
+      condition,
+      ordering,
+      pagination.getOrElse(""),
+      whereClauses ++ whereClauseFromField,
+      pagination,
+      fieldName
+    )
   }
 
-  def intermdiateV2ToSQL(intermediate: IntermediateV2, fieldNameOfObject: String, additionalCondition: Option[String]): String = {
-    val dataId = s"${fieldNameOfObject}_data"
+  def intermdiateV2ToSQL(
+      intermediate: IntermediateV2
+//      fieldNameOfObject: String,
+//      additionalCondition: Option[String]
+  ): String = {
+    val dataId = intermediate.dataId
 
     val thisTableSQL = intermediate match {
-      case IntermediateV2Regular(cols, from, responseType, condition, ordering) =>
+      case IntermediateV2Regular(
+            cols,
+            from,
+            responseType,
+            condition,
+            ordering,
+            sizing,
+            a,
+            b,
+            c
+          ) =>
         /*
         select "json_spec"
         from (
@@ -803,33 +1923,45 @@ object Util {
           select "$dataId"."colName" as "outputName",
           select "$dataId"."colName" as "outputName",
         )
-       */
+         */
         val tableCols = cols.map { col =>
           s""""$dataId"."${col.nameInTable}" as "${col.outputName}""""
         }
 
         val joinCols = intermediate.from.joins.map { join =>
           val fieldName = join.name
-          s""" "$fieldNameOfObject.$fieldName"."$fieldNameOfObject.$fieldName" as "$fieldName" """
+          s""" "${intermediate.fieldName}.$fieldName"."${intermediate.fieldName}.$fieldName" as "$fieldName" """
         } ++ List(s"""'${from.tableName}' as "__typename"""")
 
-        val effectiveCondition = (additionalCondition.toList ++ condition.toList) match {
-          case Nil => ""
-          case list => list.mkString(" where ", " AND " , "")
-        }
+        val effectiveCondition =
+          intermediate.where.filter(_.nonEmpty) match {
+            case Nil  => ""
+            case list => list.mkString(" where ", " AND ", "")
+          }
 
-          s"""
+        println(s"Condition: ${intermediate.where}. Effective: $effectiveCondition. $intermediate")
+
+        s"""
              |select row_to_json(
              |    (
              |      select "json_spec"
              |      from (
-             |        select ${(tableCols ++ joinCols).mkString(",")}
+             |        select ${(tableCols ++ joinCols).mkString(", ")}
              |      ) as "json_spec"
              |     )
-             |) as "$fieldNameOfObject"
-             |from (select * from ${from.tableName} $effectiveCondition) as "$dataId"
+             |) as "${intermediate.fieldName}"
+             |from (select * from ${from.tableName} $effectiveCondition ${intermediate.pagination.getOrElse("")}) as "$dataId"
              |    """.stripMargin
-      case IntermediateV2Union(discriminatorFieldName, discriminatorMapping, from, responseType, condition, ordering) =>
+      case IntermediateV2Union(
+            discriminatorFieldName,
+            discriminatorMapping,
+            from,
+            responseType,
+            condition,
+            ordering,
+            sizing,
+            a,b,c
+          ) =>
         /*
         select "json_spec"
         from (
@@ -850,23 +1982,26 @@ object Util {
                       '$discriminatorMapping[0][0]${outputName}', "$dataId"."colName"
                     )
         )
-       */
+         */
 
         discriminatorMapping.size match {
-          case 0 => responseType match {
-            case ObjectResponse => "select json_agg('null')"
-            case ListResponse => "select json_agg('[]')"
-          }
+          case 0 =>
+            responseType match {
+              case ObjectResponse => "select json_agg('null')"
+              case ListResponse   => "select json_agg('[]')"
+            }
           case 1 =>
             //TODO:
             "regular table"
           case _ =>
             val last = discriminatorMapping.last
-            val nMinusOne = discriminatorMapping.filterNot{case (k,_) => k.contentEquals(last._1)}
+            val nMinusOne = discriminatorMapping.filterNot { case (k, _) =>
+              k.contentEquals(last._1)
+            }
 
-            val elseClause  = last._2.map{ col =>
+            val elseClause = last._2.map { col =>
               s"""'${col.outputName}', "$dataId"."${col.nameInTable}""""
-            }++List(s"""'__typename', '${last._1}'""").mkString(
+            } ++ List(s"""'__typename', '${last._1}'""").mkString(
               s"""else
                  |  json_build_object(
                  |""".stripMargin,
@@ -874,29 +2009,31 @@ object Util {
               ")"
             )
 
-            val whenClauses = nMinusOne.map { case (discriminatorValue, columns)=>
-              columns.map{ col =>
-                s"""'${col.outputName}', "$dataId"."${col.nameInTable}""""
-              }++List(s"""'__typename', '$discriminatorValue'""").mkString(
-                s"""when "$dataId"."$discriminatorFieldName" = '$discriminatorValue'
+            val whenClauses = nMinusOne.map {
+              case (discriminatorValue, columns) =>
+                columns.map { col =>
+                  s"""'${col.outputName}', "$dataId"."${col.nameInTable}""""
+                } ++ List(s"""'__typename', '$discriminatorValue'""").mkString(
+                  s"""when "$dataId"."$discriminatorFieldName" = '$discriminatorValue'
                    |  then json_build_object(
                    |""".stripMargin,
-                ",",
-                ")"
-              )
+                  ",",
+                  ")"
+                )
             }
 
             val subSelect = responseType match {
               case ObjectResponse => " -> 0"
-              case ListResponse => ""
+              case ListResponse   => ""
             }
 
-            val effectiveCondition = (additionalCondition.toList ++ condition.toList) match {
-              case Nil => ""
-              case list => list.mkString("where ", " AND ", "")
-            }
+            val effectiveCondition =
+              (condition.toList.filter(_.nonEmpty)) match {
+                case Nil  => ""
+                case list => list.mkString("where ", " AND ", "")
+              }
 
-              s"""
+            s"""
                  |select json_agg(
                  |  select "json_spec"."object"
                  |  from (
@@ -905,8 +2042,8 @@ object Util {
                  |      $elseClause
                  |      end as "object"
                  |  ) as "json_spec"
-                 |) $subSelect as $fieldNameOfObject
-                 |from (select * from ${intermediate.from.tableName} $effectiveCondition) as "$dataId"
+                 |) $subSelect as ${intermediate.fieldName}
+                 |from (select * from ${intermediate.from.tableName} $effectiveCondition $sizing) as "$dataId"
                  |""".stripMargin
 
         }
@@ -914,8 +2051,14 @@ object Util {
 
     val joins = intermediate.from.joins.map { join =>
       (
-        intermdiateV2ToSQL(join.right, s"""${fieldNameOfObject}.${join.name}""", Option(s""""$dataId"."${join.leftColName}" = "${join.rightColName}"""")),
-        s"${fieldNameOfObject}.${join.right.from.tableName}"
+        intermdiateV2ToSQL(
+          join.right,
+//          s"""${intermediate.fieldName}.${join.name}"""
+//          Option(
+//            s""""$dataId"."${join.leftColName}" = "${join.rightColName}""""
+//          )
+        ),
+        s"${intermediate.fieldName}.${join.right.from.tableName}"
       )
     }
 
@@ -924,31 +2067,10 @@ object Util {
         acc ++ s""" LEFT JOIN LATERAL (${next._1}) as "${next._2}" on true """
       })
 
-    intermediate.responseType.wrapInErrorHandling(fieldNameOfObject, thisTableWithJoins)
-  }
-
-  def compileFrom(intermediate: Intermediate, top: Boolean): String = {
-    val joins = intermediate.from.joins.map { join =>
-      s""" LEFT JOIN ${join.right.from.tableName} on ${intermediate.from.tableName}.${join.leftColName} = ${join.right.from.tableName}.${join.rightColName} \n""" ++ compileFrom(join.right, top = false)
-    }.mkString("")
-
-    if (top) {
-      intermediate.from.tableName ++ joins
-    } else {
-      joins
-    }
-  }
-
-  def compileCols(intermediate: Intermediate): List[String] = {
-    intermediate.cols.map(col => s"${intermediate.from.tableName}.${col}") ++ intermediate.from.joins.map(_.right).flatMap(compileCols)
-  }
-
-  def toQueryNaive(intermediate: Intermediate): String = {
-    val allCols = compileCols(intermediate)
-
-    val from = compileFrom(intermediate, top = true)
-
-    s"SELECT ${allCols.mkString(",")} FROM $from"
+    intermediate.responseType.wrapInErrorHandling(
+      intermediate.fieldName,
+      thisTableWithJoins
+    )
   }
 
   /*
@@ -999,78 +2121,10 @@ object Util {
 
    */
 
-  //
-  def toQueryWithJson(intermediate: Intermediate, fieldNameOfObject: String, condition: Option[String]): String = {
-    val dataId = s"${fieldNameOfObject}_data"
-    val typeName = List(s"'${intermediate.from.tableName}' as __typename")
-    val cols = typeName ++ intermediate.cols.map { col =>
-      s""""$dataId"."$col""""
-    } ++ intermediate.from.joins.map { join =>
-
-      val fieldName = join.right.field.name
-      s""" "$fieldNameOfObject.$fieldName"."$fieldNameOfObject.$fieldName" as $fieldName """
-    }
-
-    val thisTable =
-      s"""
-         |select row_to_json(
-         |    (
-         |      select "json_spec"
-         |      from (
-         |        select ${cols.mkString(",")}
-         |      ) as "json_spec"
-         |     )
-         |) as "$fieldNameOfObject"
-         |from (select * from ${intermediate.from.tableName} ${condition.map(cond => s"where $cond").getOrElse("")}) as "$dataId"
-         |    """.stripMargin
-
-    val joins = intermediate.from.joins.map { join =>
-      (
-        toQueryWithJson(join.right, s"""${fieldNameOfObject}.${join.right.field.name}""", Option(s""""$dataId"."${join.leftColName}" = "${join.rightColName}"""")),
-        s"${fieldNameOfObject}.${join.right.from.tableName}"
-      )
-    }
-
-    val complete = joins
-      .foldLeft(thisTable)((acc, next) => {
-        acc ++ s""" LEFT JOIN LATERAL (${next._1}) as "${next._2}" on true """
-      })
-
-    intermediate.field.fieldType.kind match {
-      case __TypeKind.OBJECT =>
-
-        s"""|SELECT coalesce((json_agg("root") -> 0), 'null') AS "$fieldNameOfObject"
-            |from ($complete) as "$fieldNameOfObject" """.stripMargin
-
-      // List[A] and Option[List[A]] gets treated the same. No rows -> Empty list
-      case __TypeKind.LIST =>
-        s"""
-           |select coalesce(json_agg("$fieldNameOfObject"), '[]') as "${fieldNameOfObject}"
-           |from ($complete) as "$fieldNameOfObject"
-           |""".stripMargin
-      // List[A] and Option[List[A]] gets treated the same. No rows -> Empty list
-      case __TypeKind.NON_NULL if intermediate.field.fieldType.ofType.map(_.kind).contains(__TypeKind.LIST) =>
-
-        s"""
-           |select coalesce(json_agg("$fieldNameOfObject"), '[]') as "${fieldNameOfObject}"
-           |from ($complete) as "$fieldNameOfObject"
-           |""".stripMargin
-
-      case __TypeKind.NON_NULL =>
-        complete
-      // Below is irrelevant
-      case __TypeKind.SCALAR => ""
-      case __TypeKind.INTERFACE => ""
-      case __TypeKind.UNION => ""
-      case __TypeKind.ENUM => ""
-      case __TypeKind.INPUT_OBJECT => ""
-    }
-  }
-
   def compileOfType(tpe: __Type): List[String] = {
     tpe.ofType match {
       case Some(value) => tpe.name.toList ++ compileOfType(value)
-      case None => tpe.name.toList
+      case None        => tpe.name.toList
     }
   }
 }
@@ -1084,9 +2138,9 @@ object PostgresSniffer {
     }.toList
   }
 
-  val typeMap = mutable.Map.empty[String, CaseClassType]
-
-  def extractFunctionColumns(resultSet: ResultSet)(implicit c: Connection): FunctionColumnInfo = {
+  def extractFunctionColumns(
+      resultSet: ResultSet
+  )(implicit c: Connection): FunctionColumnInfo = {
     FunctionColumnInfo(
       resultSet.getString("FUNCTION_NAME"),
       resultSet.getString("COLUMN_NAME"),
@@ -1101,7 +2155,9 @@ object PostgresSniffer {
     )
   }
 
-  def extractFunctions(resultSet: ResultSet)(implicit c: Connection): FunctionInfo = {
+  def extractFunctions(
+      resultSet: ResultSet
+  )(implicit c: Connection): FunctionInfo = {
     FunctionInfo(
       resultSet.getString("FUNCTION_NAME"),
       resultSet.getString("REMARKS"),
@@ -1109,7 +2165,9 @@ object PostgresSniffer {
     )
   }
 
-  def extractProcedureColumns(resultSet: ResultSet)(implicit c: Connection): ProcedureColumnInfo =  {
+  def extractProcedureColumns(
+      resultSet: ResultSet
+  )(implicit c: Connection): ProcedureColumnInfo = {
     ProcedureColumnInfo(
       resultSet.getString("PROCEDURE_NAME"),
       resultSet.getString("COLUMN_NAME"),
@@ -1122,14 +2180,18 @@ object PostgresSniffer {
     )
   }
 
-  def extractProcedures(resultSet: ResultSet)(implicit c: Connection): ProcedureInfo = {
+  def extractProcedures(
+      resultSet: ResultSet
+  )(implicit c: Connection): ProcedureInfo = {
     ProcedureInfo(
       resultSet.getString("PROCEDURE_NAME"),
       resultSet.getString("REMARKS")
     )
   }
 
-  def extractPrimaryKey(resultSet: ResultSet)(implicit c: Connection): PrimaryKeyInfo = {
+  def extractPrimaryKey(
+      resultSet: ResultSet
+  )(implicit c: Connection): PrimaryKeyInfo = {
     val columnName = resultSet.getString("COLUMN_NAME")
     val keySeq = resultSet.getInt("KEY_SEQ")
     val name = resultSet.getString("PK_NAME")
@@ -1155,8 +2217,8 @@ object PostgresSniffer {
     val dataTyp = resultSet.getInt("DATA_TYPE")
     val isNullable = resultSet.getString("IS_NULLABLE") match {
       case "YES" => true
-      case "NO" => false
-      case _ => true
+      case "NO"  => false
+      case _     => true
     }
     val typeName = resultSet.getString("TYPE_NAME")
     ColumnInfo(columnName, isNullable, dataTyp, typeName, tableName)
@@ -1196,643 +2258,126 @@ object PostgresSniffer {
     )
   }
 
-  def toJVMType(dataType: Int): String = {
-    dataType match {
-      case 4 => "Int"
-      case 12 => "String"
-      case 1111 => "UUID"
-      case 93 => "ZonedDateTime"
-    }
-  }
-
-  def toScalaType(table: Table, columns: List[Column]): String = {
-    val fields = columns.map { col =>
-      val fieldType = if (col.nullable) s"Option[${toJVMType(col.sqltype)}]" else toJVMType(col.sqltype)
-      s"${col.name}: ${fieldType}"
-    }
-    s"case class ${table.name}(${fields.mkString(",")})"
-  }
-
-  def toScalaScalar(sqlType: Int): BaseType = {
-    sqlType match {
-      case 4 => IntegerType
-      case 12 => StringType
-      case 1111 => UUIDType
-      case 93 => ZonedDateTimeType
-    }
-  }
-
-  def toScalaType(column: Column): ScalaType = {
-    val innerType = column.sqltype match {
-      case 4 => IntegerType
-      case 12 => StringType
-      case 1111 => UUIDType
-      case 93 => ZonedDateTimeType
-    }
-    if (column.nullable) {
-      OptionType(innerType)
-    } else innerType
-  }
-
-
-  def toCaseClassType(table: Table, extensions: List[ObjectExtension])(tables: List[Table]): CaseClassType = {
-    val primaryKeyFields = table.primaryKeys.map(col => Field(col.name, Concrete(toScalaType(col)), isPrimaryKey = true, isExtension = false, Nil, false))
-    val otherColFields = table.otherColumns.map(col => Field(col.name, Concrete(toScalaType(col)), isPrimaryKey = false, isExtension = false, Nil, false))
-    val applicableExtensions = extensions.filter(_.objectName.contentEquals(table.name)).map { objectExtension =>
-      Field(objectExtension.field.fieldName, Concrete(objectExtension.field.fieldType), isPrimaryKey = false, isExtension = true, objectExtension.field.requiredFields, isRelationship = false, isExternal = objectExtension.field.isExternal)
-    }
-    val relationshipFields = table.relationships.map { link =>
-
-      if (link.pkTableName == table.name) {
-        // Some other table references this table
-        // Options are -> Option["other-type"], List["other-type"]
-
-        // "other-type" cant occur. We are the primary
-        // Option["other-type"] can occur. Our reference is unique and their reference is unique
-        // List["other-type"] can occur. Our reference is non-unique or their reference is non-unique
-        val otherTableName = if (link.pkTableName == table.name) link.fkTableName else link.pkTableName
-
-        val thisTableReferenceName = if (link.pkTableName == table.name) link.pkColumnName else link.fkColumnName
-        val thatTableReferenceName = if (link.pkTableName == table.name) link.fkColumnName else link.pkColumnName
-
-        val thisTableReferenceUnique = (table.primaryKeys ++ table.otherColumns).find(_.name == thisTableReferenceName).map(_.unique).getOrElse(throw new RuntimeException(s"Unable to find column ${thisTableReferenceName} mentioned in $link"))
-        val thatTable = tables.find(_.name == otherTableName).getOrElse(throw new RuntimeException(s"Unable to find table $otherTableName mentioned in ${link}"))
-        val thatTableReferenceUnique = (thatTable.primaryKeys ++ thatTable.otherColumns).find(_.name == thatTableReferenceName).map(_.unique).getOrElse(throw new RuntimeException(s"Unable to find column ${thatTableReferenceName} mentioned in $link"))
-        val linkType = if (thisTableReferenceUnique && thatTableReferenceUnique)
-          () => OptionType(typeMap(otherTableName))
-        else {
-          () => ListType(typeMap(otherTableName))
-        }
-        val fieldName = if ((primaryKeyFields ++ otherColFields).exists(_.name == otherTableName)) s"${otherTableName}_ref" else otherTableName
-        Field(fieldName, Reference(linkType), isPrimaryKey = false, isExtension = false, Nil, isRelationship = true)
-      } else {
-        // This table is foreign key, we are linking to some other table
-
-        val otherTableName = if (link.pkTableName == table.name) link.fkTableName else link.pkTableName
-        val thisTableReferenceName = if (link.pkTableName == table.name) link.pkColumnName else link.fkColumnName
-        val thatTableReferenceName = if (link.pkTableName == table.name) link.fkColumnName else link.pkColumnName
-
-        val thisTableReferenceNullable = (table.primaryKeys ++ table.otherColumns).find(_.name == thisTableReferenceName).map(_.nullable).getOrElse(throw new RuntimeException(s"Unable to find column ${thisTableReferenceName} mentioned in $link"))
-        val thatTable = tables.find(_.name == otherTableName).getOrElse(throw new RuntimeException(s"Unable to find table $otherTableName mentioned in ${link}"))
-        val thatTableReferenceUnique = (thatTable.primaryKeys ++ thatTable.otherColumns).find(_.name == thatTableReferenceName).map(_.unique).getOrElse(throw new RuntimeException(s"Unable to find column ${thatTableReferenceName} mentioned in $link"))
-
-        // For "other-type" to occur our reference must be non-nullable and their reference must be unique
-        // for Option["other-type"] to occur our reference must be nullable and their reference must be unique
-        // for List["other-type"] to occur our reference must be nullable and their reference must not be unique
-        // for NonEmptyList["other-type"] to occur our reference be non-nullable and their reference must not non unique
-        // if this tables reference column is non-nullable AND that tables reference column is unique THEN "other-type"
-        // if this tables reference column is nullable AND that tables reference column is unique THEN Option["other-type"]
-        // if this tables reference column is nullable AND that tables reference column is not unique THEN List["other-type"]
-        // if this tables reference column is non-nullable AND that tables reference column is not unique THEN NonEmptyList["other-type"]
-        val linkType = (thisTableReferenceNullable, thatTableReferenceUnique) match {
-          case (true, true) => () => OptionType(typeMap(otherTableName))
-          case (true, false) => () => ListType(typeMap(otherTableName))
-          case (false, false) => () => ListType(typeMap(otherTableName)) // Could refine to non-empty list
-          case (false, true) => () => typeMap(otherTableName)
-        }
-        val fieldName = if ((primaryKeyFields ++ otherColFields).exists(_.name == otherTableName)) s"${otherTableName}_ref" else otherTableName
-        Field(fieldName, Reference(linkType), isPrimaryKey = false, isExtension = false, Nil, isRelationship = true)
-      }
-
-
-    }
-    val result = CaseClassType(table.name, primaryKeyFields ++ otherColFields ++ relationshipFields ++ applicableExtensions, isBaseTableClass = true)
-    typeMap.put(table.name, result)
-    result
-  }
-
-  def caseClassToModel(caseClass: CaseClassType): String = caseClass.render
-
-  // TODO: Need to fix this excessive wrapping
-  def caseClassToInsertOp(caseClass: CaseClassType): FunctionType = {
-    val input = CaseClassType(s"Create${caseClass.name}Input", caseClass.fields.filterNot(_.isExtension).filterNot(_.isRelationship).filterNot(_.isExternal), isInsertForTable =Option(caseClass.name))
-    FunctionType(s"insert_${caseClass.name}", List(FunctionArg("objectO", input)), caseClass) // TODO: Fix Object name
-  }
-
-  def caseClassToInsertManyOp(caseClass: CaseClassType): FunctionType = {
-    val input = CaseClassType(s"Create${caseClass.name}Input", caseClass.fields.filterNot(_.isExtension).filterNot(_.isRelationship).filterNot(_.isExternal), isInsertForTable = Option(caseClass.name))
-    FunctionType(s"insert_many_${caseClass.name}", List(FunctionArg("object", ListType(input))), ListType(caseClass))
-  }
-
-  /** GraphQL does not support unions in inputs, so to update objects the normal way of doing it to do something like the following
-   *
-   * type User {
-   * id: ID!
-   * name: String
-   * email: String!
-   * }
-   * input SetUserFields {
-   * id: ID
-   * name: String
-   * email: String
-   * }
-   *
-   * input UserPK {
-   * id: ID!
-   * }
-   *
-   * type UpdateUsersResponse {
-   * affected_rows: Int!
-   * returning: [User!]!
-   * }
-   *
-   * type Mutation {
-   * update_user(pk: UserPK!, updates: SetUserFields!): UpdateUsersResponse
-   * }
-   *
-   * The server then interprets it such that all fields that are set will be updated. This means that
-   *
-   * {
-   * name: null
-   * }
-   *
-   * is interpreted differently than
-   * {
-   *
-   * }
-   *
-   * as an update. The first object will explicitly delete the name, the send object will leave name unmodified.
-   *
-   * There is really no alternative to this except a method per possible combination of updates.
-   * The reason for this is the lack of union support in input types. With union support in input types something like the following could be done.
-   *
-   * input UpdateUserName {
-   * name: String
-   * }
-   *
-   * input UpdateUserEmail {
-   * email: String!
-   * }
-   *
-   * input union UpdateUserField = UpdateUserName | UpdateUserEmail
-   *
-   * type Mutation {
-   * update_user(pk: UserPK!, updates: [UpdateUserField!]!): UpdateUsersResponse
-   * }
-   */
-
-
-  def caseClassToUpdateOp(caseClass: CaseClassType): FunctionType = {
-    val pkSelectorCaseClass = CaseClassType(s"${caseClass.name}PK", caseClass.fields.filter(_.isPrimaryKey), isUpdateForTable = Option(caseClass.name))
-    val valueCaseClass = CaseClassType(s"Set${caseClass.name}Fields", caseClass.fields.filterNot(_.isPrimaryKey).filterNot(_.isExtension))
-    val wrapperClassFields = List(
-      Field("pk", Concrete(pkSelectorCaseClass), false, false, Nil, false),
-      Field("set", Concrete(valueCaseClass), false, false, Nil, false)
-    )
-    val argWrapperClass = FunctionArg("arg", CaseClassType(s"Update${caseClass.name}Args", wrapperClassFields, isUpdateForTable = Option(caseClass.name)))
-
-    // Caliban is unable to derive schemas when signatures are codegen.Field => (A,B) => Output
-    // So we wrap (A,B) in C so the signature becomes codegen.Field => C => Output
-
-    val responseFields = List(
-      Field("affected_rows", Concrete(IntegerType), false, false, Nil, false),
-      Field("rows", Concrete(caseClass), false, false, Nil, false)
-    )
-
-    val returnCaseClass = CaseClassType(s"Mutate${caseClass.name}Response", responseFields)
-
-    FunctionType(s"update_${caseClass.name}", List(argWrapperClass), returnCaseClass)
-  }
-
-  // Requires the notion of filtering function
-  def caseClassToUpdateManyOp(caseClass: CaseClassType): FunctionType = ???
-
-  def caseClassToDeleteOp(caseClass: CaseClassType): FunctionType = {
-    val pkSelectorCaseClass = CaseClassType(s"${caseClass.name}PK", caseClass.fields.filter(_.isPrimaryKey), isDeleteForTable = Option(caseClass.name))
-
-    FunctionType(s"delete_${caseClass.name}", List(FunctionArg("pk", pkSelectorCaseClass)), caseClass)
-  }
-
-  // Requires the notion of a filtering function
-  def caseClassToDeleteManyOp(caseClass: CaseClassType): FunctionType = ???
-
-  def caseClassToGetByIdOp(caseClass: CaseClassType): Option[FunctionType] = {
-    caseClass.fields.filter(_.isPrimaryKey) match {
-      case Nil => None
-      case primaryKeys =>
-        val pkSelectorCaseClass = CaseClassType(s"${caseClass.name}PK", primaryKeys)
-        Option(FunctionType(s"get_${caseClass.name}_by_id", List(FunctionArg("pk", pkSelectorCaseClass)), OptionType(caseClass)))
-    }
-
-  }
-
-  // Requires the notion of a filtering function
-  def caseClassToSearchByValueOp(caseClass: CaseClassType, indexes: List[IndexInfo]): CaseClassType = ???
-
-
-  def toTables(tableInfo: List[TableInfo], columns: List[ColumnInfo], primaryKeyInfo: List[PrimaryKeyInfo], exportedKeys: List[ExportedKeyInfo], importedKeys: List[ImportedKeyInfo], indexes: List[IndexInfo]): List[Table] = {
+  def toTablesV2(
+      tableInfo: List[TableInfo],
+      columns: List[ColumnInfo],
+      primaryKeyInfo: List[PrimaryKeyInfo],
+      exportedKeys: List[ExportedKeyInfo],
+      importedKeys: List[ImportedKeyInfo],
+      indexes: List[IndexInfo],
+      extensions: List[Version2.ObjectExtension]
+  ): List[Whatever.Table] = {
     tableInfo.map { table =>
       val tableIndexes = indexes.filter(_.tableName.contentEquals(table.name))
-      val primaryKey = primaryKeyInfo.filter(v => v.tableName.contentEquals(table.name))
-      val allColumns = columns.filter(_.tableName.contentEquals(table.name))
-        .map(colInfo => Column(colInfo.name, colInfo.nullable, colInfo.sqltype, colInfo.typeName, tableIndexes.exists(index => index.columnName.contentEquals(colInfo.name) && !index.nonUnique)))
-      val (primaryKeyColumn, otherColumns) = allColumns.partition(column => primaryKey.exists(_.columnName.contentEquals(column.name)))
+      val primaryKey =
+        primaryKeyInfo.filter(v => v.tableName.contentEquals(table.name))
+      val allColumns = columns
+        .filter(_.tableName.contentEquals(table.name))
+        .map(colInfo =>
+          Column(
+            colInfo.name,
+            colInfo.nullable,
+            colInfo.sqltype,
+            colInfo.typeName,
+            tableIndexes.exists(index =>
+              index.columnName.contentEquals(colInfo.name) && !index.nonUnique
+            )
+          )
+        )
+      val (primaryKeyColumn, otherColumns) = allColumns.partition(column =>
+        primaryKey.exists(_.columnName.contentEquals(column.name))
+      )
       val links = exportedKeys.filter { key =>
         List(key.fkTableName, key.pkTableName).contains(table.name)
       }
-      Table(table.name, primaryKeyColumn, otherColumns, table.comment, links)
-    }
-  }
-
-
-  def extractComposite(caseClassType: CaseClassType): List[CaseClassType] = {
-    caseClassType.fields.flatMap { field =>
-      val fieldType = field.scalaType match {
-        case Concrete(scalaType) => scalaType
-        case Reference(scalaType) => scalaType()
-      }
-
-      fieldType match {
-        case c: CaseClassType =>
-          val recursive = c.fields
-            .flatMap(v => extractAllCompositeTypes(v.scalaType match {
-              case Concrete(scalaType) => scalaType
-              case Reference(scalaType) => scalaType()
-            }))
-          List(c) ++ recursive
-        case _ => Nil
+      primaryKeyColumn match {
+        case Nil =>
+          Whatever.NonPrimaryKeyTable(
+            table.name,
+            otherColumns,
+            table.comment,
+            links,
+            extensions.filter(_.objectName.contentEquals(table.name))
+          )
+        case ::(head, tail) =>
+          Whatever.PrimaryKeyTable(
+            table.name,
+            NonEmptyChunk(head, tail: _*),
+            otherColumns,
+            table.comment,
+            links,
+            extensions.filter(_.objectName.contentEquals(table.name))
+          )
       }
     }
-  }
-
-  def extractAllCompositeTypes(scalaType: ScalaType): List[CaseClassType] = {
-    scalaType match {
-      case c: CaseClassType =>
-        extractComposite(c)
-      case _ => Nil
-    }
-  }
-
-  def usedTypes(tpe: ScalaType, acc: List[String]): List[String] = {
-    tpe match {
-      case baseType: BaseType => acc ++  List(baseType.name)
-      case containerType: ContainerType => containerType match {
-        case ListType(elementType) => usedTypes(elementType, acc)
-        case OptionType(elementType) => usedTypes(elementType, acc)
-      }
-      case c: CaseClassType =>
-        if(acc.contains(c.name)) {
-          acc
-        } else {
-          c.fields.flatMap(field =>usedTypes(field.scalaType.strict(), acc ++ List(c.name)))
-        }
-    }
-  }
-
-  def to2CalibanBoilerPlate(apis: List[TableAPI], extensions: List[ObjectExtension], tables: List[Table], externalEntities: List[ExternalEntity]): String = {
-    val imports =
-      """
-        |import caliban._
-        |import caliban.GraphQL.graphQL
-        |import caliban.execution.Field
-        |import caliban.schema.{ArgBuilder, GenericSchema}
-        |import caliban.schema.Schema.gen
-        |import caliban.schema._
-        |import caliban.schema.Annotations.GQLDirective
-        |import caliban.InputValue.ObjectValue
-        |import caliban.InputValue
-        |import caliban.federation._
-        |import caliban.introspection.adt.{__Directive, __Type}
-        |import caliban.wrappers.Wrapper
-        |import caliban.parsing.adt.Type
-        |import generic._
-        |import zio.ZIO
-        |import zio.query.ZQuery
-        |import generic.Util._
-        |import io.circe.Json
-        |import io.circe.generic.auto._, io.circe.syntax._
-        |import codegen.{Table, Column, ExportedKeyInfo, ObjectExtension, ObjectExtensionField}
-        |import java.sql.Connection
-        |
-        |import java.time.ZonedDateTime
-        |import java.util.UUID
-        |""".stripMargin
-
-    val allOps = apis.flatMap(api => api.delete.toList ++ api.insert.toList ++ api.update.toList ++ api.getById.toList)
-    val readOps = apis.flatMap(api => api.getById.toList)
-    val writeOps = apis.flatMap(api => api.delete.toList ++ api.insert.toList ++ api.update.toList)
-
-    // Model
-
-    val models = apis.map(api => api.caseClass.render2()).mkString("\n")
-
-    // External Entities
-
-    val federatedEntities = externalEntities.map { externalEntity =>
-      val fields = externalEntity.fields.map { field =>
-        val annotations = if(field.external) s"@GQLDirective(External)" else ""
-        s"$annotations ${field.name}: ${federatedGraphqlTypeToScalaType(field.tpe).name}"
-      }
-      s"""@GQLDirective(Extend) @GQLDirective(Key(${externalEntity.keys.mkString(" ")}))case class ${externalEntity.name}(${fields.mkString(",")})"""
-    }
-
-    val reachableTypenames = apis.map(api => api.caseClass).flatMap(usedTypes(_, Nil))
-    val unreacheableTypes = externalEntities
-      .filterNot { externalEntity => reachableTypenames.exists(_.contentEquals(externalEntity.name))}
-
-    val unreachableTypeMethods = unreacheableTypes
-      .map { externalEntity =>
-        val typeName = externalEntity.name
-        s"def create${typeName}Schema()(implicit schema: Schema[Any, ${typeName}]) : __Type = schema.toType_()"
-      }
-
-    val unreachableTypeInvocations = unreacheableTypes.map { unreachableType =>
-      s"create${unreachableType.name}Schema()"
-    }
-
-    // Extension Args
-
-    val extensionArgs = extensions.map { extension =>
-      val caseClassName = s"${extension.objectName}${extension.field.fieldName}ExtensionArgs"
-      val requiredFields =
-        apis
-          .find(_.caseClass.name.contentEquals(extension.objectName)).getOrElse(throw new RuntimeException(s"Unable to find tableAPI for extension ${extensions}"))
-          .caseClass.fields.filter(tableField => extension.field.requiredFields.exists(_.contentEquals(tableField.name)))
-      CaseClassType(caseClassName, requiredFields.map(_.copy(isPrimaryKey = false))).render2()
-    }.mkString("\n")
-
-    // Federation args
-
-    val federationArgClasses = apis
-      .filter(_.caseClass.fields.exists(_.isPrimaryKey))
-      .map(api => api.caseClass.copy(name = s"${api.caseClass.name}FederationArg",isFederationArg = Option(api.caseClass.name),fields = api.caseClass.fields.filter(_.isPrimaryKey)))
-
-    val federationArgs = federationArgClasses
-      .map(_.render2()).mkString("\n")
-
-    // Output types
-    val outputTypes = (apis.map(_.caseClass) ++ allOps.map(_.returnType))
-    .filterNot(output => apis.map(_.caseClass).contains(output)).filter {
-      case c: CaseClassType => true
-      case _ => false
-    }.map(_.render)
-
-    // Args
-    val opArgs = apis
-      .flatMap(api =>
-        (api.delete.toList.flatMap(_.args) ++
-          api.insert.toList.flatMap(_.args) ++
-          api.update.toList.flatMap(_.args) ++
-          api.getById.toList.flatMap(_.args)
-          ).map(_.tpe).groupBy(_.name).flatMap(_._2.headOption))
-    val additional = opArgs.flatMap(v => extractAllCompositeTypes(v))
-    println("ADDITIONAL")
-    additional.foreach(println)
-    println("ADDITIONAL")
-    val args = (opArgs ++ additional)
-      .groupBy(_.name)
-      .flatMap(_._2.headOption)
-      .filterNot(arg => apis.map(_.caseClass).contains(arg))
-      .filterNot(c => externalEntities.exists(_.name.contentEquals(c.name)))
-
-
-    val argCode = args.map {
-      case baseType: BaseType => baseType.render
-      case containerType: ContainerType => containerType.render
-      case c : CaseClassType => c.copy(fields = c.fields.filterNot(_.isRelationship)).render2
-    }
-
-    // QueryRoot
-    // TODO: Do something about tables with no
-    val renderedQueryOps = readOps.map { functionType =>
-      val renderedReturnType = functionType.returnType.name
-
-      if (functionType.args.isEmpty) s"${functionType.name}: ${renderedReturnType}"
-      else {
-        val renderedArgs = functionType.args.map(_.tpe.name)
-        s"${functionType.name}: (Field) =>  ${renderedArgs.mkString("(", ",", ")")} => ${renderedReturnType}"
-      }
-    }
-    val queryRoot =
-      s"""case class Queries (
-         |${renderedQueryOps.map(str => s"\t$str").mkString(", \n")}
-         |)""".stripMargin
-
-    val renderedMutationOps = writeOps.map { functionType =>
-      val renderedReturnType = functionType.returnType.name
-
-      if (functionType.args.isEmpty) s"${functionType.name}: ${renderedReturnType}"
-      else {
-        val renderedArgs = functionType.args.map(_.tpe.name)
-        s"${functionType.name}: (Field) =>  ${renderedArgs.mkString("(", ",", ")")} => ${renderedReturnType}"
-      }
-    }
-
-    val mutationRoot =
-      s"""case class Mutations(
-         |${renderedMutationOps.map(str => s"\t${str}").mkString(", \n")}
-         |)
-         |""".stripMargin
-
-
-    val extensionMethods = extensions.map { extension =>
-      val methodName = s"${extension.objectName}${extension.field.fieldName}"
-      val otherArgs = s"${extension.objectName}${extension.field.fieldName}ExtensionArgs"
-      val returnType = extension.field.fieldType.name
-      s"def $methodName(field: Field, args: $otherArgs): ZIO[Any,Throwable, $returnType]"
-    }
-    val extensionTrait =
-      s"""trait Extensions {
-        | ${extensionMethods.mkString("\n")}
-        |}""".stripMargin
-
-    val entityResolverMethods = apis.filter(_.caseClass.fields.exists(_.isPrimaryKey)).map{ api =>
-      val params = "extensions: ExtensionLogicMap, tables: List[Table], conditionsHandlerMap: Map[String, ObjectValue => String], connection: Connection"
-      val implicitParams = s"schema: Schema[Any,${api.caseClass.name}]"
-      s"""def create${api.caseClass.name}EntityResolver($params)(implicit $implicitParams): EntityResolver[Any] = new EntityResolver[Any] {
-         |    override def resolve(value: InputValue): ZQuery[Any, CalibanError, Step[Any]] = genericEntityHandler(extensions, tables, conditionsHandlerMap, connection)(value)
-         |    override def toType: __Type = schema.toType_()
-         |}""".stripMargin
-    }
-
-    val unreachableTypesObjet =
-      s"""object UnreachableTypes {
-         |   ${unreachableTypeMethods.mkString("\n")}
-         |}""".stripMargin
-
-
-    val entityResolvers =
-      s"""object EntityResolvers {
-        | ${entityResolverMethods.mkString("\n")}
-        |}""".stripMargin
-
-    val tableList = tables.map(_.renderSelf()).mkString("List(", ",", ")")
-
-    val extensionLogicEntries = extensions.map { extension =>
-      val extensionInputType = s"${extension.objectName}${extension.field.fieldName}ExtensionArgs"
-      val extensionMethodName = s"${extension.objectName}${extension.field.fieldName}"
-      val requiredFields = extension.field.requiredFields.map(reqField => s""""$reqField"""").mkString(",")
-      s"""ExtensionPosition("${extension.objectName}","${extension.field.fieldName}", List($requiredFields)) -> middleGenericJsonObject[$extensionInputType,${extension.field.fieldType.name}](extensions.${extensionMethodName})("${extension.field.fieldName}")"""
-    }
-
-    val insertByFieldNameEntries = apis.flatMap(_.insert).map { insertOp =>
-      s""""${insertOp.name}" -> convertInsertInput[${insertOp.args.head.tpe.name}]"""
-    }
-    val updateByFieldNameEntries = List("")
-    val deleteByFieldNameEntries = List("")
-
-    val entityResolverConditionsHandlerEntries = federationArgClasses.flatMap { federationArg =>
-      federationArg.isFederationArg.map{ tableName =>
-        s""""${tableName}" -> convertFederationArg[${federationArg.name}]"""
-      }
-    }
-
-    val federationInvocationParams = apis.filter(_.caseClass.fields.exists(_.isPrimaryKey)).map { api =>
-      s"""create${api.caseClass.name}EntityResolver(extensionLogicByType, tables, entityResolverConditionByTypeName, connection)"""
-    } match {
-      case ::(head, next) => s"baseApi,${head}, ${next.mkString(",")}"
-      case Nil => "baseApi"
-    }
-
-    val apiClass =
-      s"""class API(extensions: Extensions, connection: Connection)(implicit val querySchema: Schema[Any, Queries], mutationSchema: Schema[Any, Mutations]) {
-         |   import EntityResolvers._
-         |   import UnreachableTypes._
-         |   val tables = $tableList
-         |
-         |   val extensionLogicByType: ExtensionLogicMap = List(
-         |      ${extensionLogicEntries.mkString(",\n")}
-         |   )
-         |
-         |   val insertByFieldName: Map[String, Json => String] = Map(
-         |      ${insertByFieldNameEntries.mkString(",\n")}
-         |   )
-         |
-         |   val updateByFieldName: Map[String, Json => String] = Map(
-         |      ${updateByFieldNameEntries.mkString(",\n")}
-         |   )
-         |
-         |   val deleteByFieldName: Map[String, Json => String] = Map(
-         |      ${deleteByFieldNameEntries.mkString(",\n")}
-         |   )
-         |
-         |   val entityResolverConditionByTypeName: Map[String, ObjectValue => String]= Map(
-         |      ${entityResolverConditionsHandlerEntries.mkString(",\n")}
-         |   )
-         |
-         |  val baseApi = new GraphQL[Any] {
-         |    override protected val schemaBuilder: RootSchemaBuilder[Any] = RootSchemaBuilder(
-         |      Option(
-         |        constructQueryOperation[Any,Queries](
-         |          connection,
-         |          extensionLogicByType,
-         |          tables
-         |        )
-         |      ),
-         |      Option(
-         |        constructMutationOperation[Any, Mutations](
-         |          connection,
-         |          extensionLogicByType,
-         |          tables,
-         |          insertByFieldName,
-         |          updateByFieldName,
-         |          deleteByFieldName
-         |        )
-         |      ),
-         |      None
-         |    )
-         |    override protected val wrappers: List[Wrapper[Any]] = Nil
-         |    override protected val additionalDirectives: List[__Directive] = Nil
-         |  }
-         |
-         |    def createApi(
-         |               ): GraphQL[Any] = {
-         |    federate(
-         |      $federationInvocationParams
-         |    ).withAdditionalTypes(List(${unreachableTypeInvocations.mkString(", ")}))
-         |  }
-         |}
-         |""".stripMargin
-
-    s"""
-       |$imports
-       |
-       |$models
-       |
-       |${federatedEntities.mkString("\n")}
-       |
-       |$extensionArgs
-       |
-       |$federationArgs
-       |
-       |${outputTypes.mkString("\n")}
-       |
-       |${argCode.mkString("\n")}
-       |
-       |$queryRoot
-       |
-       |$mutationRoot
-       |
-       |$extensionTrait
-       |
-       |$entityResolvers
-       |
-       |$unreachableTypesObjet
-       |
-       |$apiClass
-       |""".stripMargin
   }
 
   def extractNameWithWrapper(tpe: __Type, wrapper: Option[String]): String = {
     tpe.kind match {
       case __TypeKind.SCALAR =>
         val base = tpe.name.get match {
-          case "String" => "String"
+          case "String"  => "String"
           case "Integer" => "Int"
-          case "ID" => "UUID"
+          case "ID"      => "UUID"
         }
         wrapper.map(wrap => s"$wrap[$base]").getOrElse(base)
       case __TypeKind.OBJECT =>
         val base = extractTypeName(tpe)
         wrapper.map(wrap => s"$wrap[$base]").getOrElse(base)
-      case __TypeKind.INTERFACE => ???
-      case __TypeKind.UNION => ???
-      case __TypeKind.ENUM => ???
+      case __TypeKind.INTERFACE    => ???
+      case __TypeKind.UNION        => ???
+      case __TypeKind.ENUM         => ???
       case __TypeKind.INPUT_OBJECT => ???
-      case __TypeKind.LIST => extractNameWithWrapper(tpe.ofType.get, Option("List"))
+      case __TypeKind.LIST =>
+        extractNameWithWrapper(tpe.ofType.get, Option("List"))
       case __TypeKind.NON_NULL => extractNameWithWrapper(tpe.ofType.get, None)
     }
   }
 
-  def graphqlTypeToScalaType(tpe: Type): ScalaType = {
+  def graphqlTypeToScalaType(tpe: Type): Version2.ScalaType = {
     val inner = tpe match {
-      case Type.NamedType(name, nonNull) => name match {
-        case "Int" => IntegerType
-        case "String" => StringType
-        case "ID" => UUIDType
-        case _ => typeMap(name)
-      }
-      case Type.ListType(ofType, nonNull) =>ListType(graphqlTypeToScalaType(ofType))
+      case Type.NamedType(name, nonNull) =>
+        name match {
+          case "Int"    => ScalaInt
+          case "String" => ScalaString
+          case "ID"     => ScalaUUID
+          case _        => globalTypeMap(name)
+        }
+      case Type.ListType(ofType, nonNull) =>
+        ScalaList(graphqlTypeToScalaType(ofType))
     }
-    if(tpe.nullable) {
-      OptionType(inner)
+    if (tpe.nullable) {
+      ScalaOption(inner)
     } else {
       inner
     }
   }
 
-  def federatedGraphqlTypeToScalaType(tpe: Type): ScalaType = {
+  def federatedGraphqlTypeToScalaType(tpe: Type): Version2.ScalaType = {
     val inner = tpe match {
-      case Type.NamedType(name, nonNull) => name match {
-        case "Int" => IntegerType
-        case "String" => StringType
-        case "ID" => UUIDType
-        case _ => typeMap(name)
-      }
-      case Type.ListType(ofType, nonNull) =>ListType(federatedGraphqlTypeToScalaType(ofType))
+      case Type.NamedType(name, nonNull) =>
+        name match {
+          case "Int"    => ScalaInt
+          case "String" => ScalaString
+          case "ID"     => ScalaUUID
+          case _        => globalTypeMap(name)
+        }
+      case Type.ListType(ofType, nonNull) =>
+        ScalaList(federatedGraphqlTypeToScalaType(ofType))
     }
-    if(tpe.nullable) {
-      OptionType(inner)
+    if (tpe.nullable) {
+      ScalaOption(inner)
     } else {
       inner
     }
   }
 
-
-
-  def connToTables(implicit conn: Connection): List[Table] = {
+  def connToTables2(
+      extensions: List[Version2.ObjectExtension]
+  )(implicit conn: Connection): List[Whatever.Table] = {
     val tablesRs = conn.getMetaData.getTables(null, null, null, Array("TABLE"))
-    val tableInfo = results(tablesRs)(extractTable).filterNot(_.name.startsWith("hdb"))
+    val tableInfo =
+      results(tablesRs)(extractTable).filterNot(_.name.startsWith("hdb"))
 
     val columnRs = conn.getMetaData.getColumns(null, null, null, null)
     val columnInfo = results(columnRs)(extractColumn)
@@ -1843,7 +2388,8 @@ object PostgresSniffer {
     }
 
     val indexInfo = tableInfo.flatMap { table =>
-      val indexRs = conn.getMetaData.getIndexInfo(null, null, table.name, false, true)
+      val indexRs =
+        conn.getMetaData.getIndexInfo(null, null, table.name, false, true)
       val indexes = results(indexRs)(extractIndexInfo)
       indexes
     }
@@ -1863,59 +2409,44 @@ object PostgresSniffer {
     importedKeyInfo.foreach(println)
     println()
 
-    toTables(tableInfo, columnInfo, primaryKeyInfo, exportedKeyInfo, importedKeyInfo, indexInfo)
+    toTablesV2(
+      tableInfo,
+      columnInfo,
+      primaryKeyInfo,
+      exportedKeyInfo,
+      importedKeyInfo,
+      indexInfo,
+      extensions
+    )
   }
-
-  def tablesToTableAPI(tables: List[Table], extensions: List[ObjectExtension]): List[TableAPI] = {
-    tables.map(toCaseClassType(_, extensions)(tables)).map { tableCaseClass =>
-      if(tableCaseClass.fields.exists(_.isPrimaryKey)) {
-        TableAPI(
-          tableCaseClass,
-          Option(caseClassToUpdateOp(tableCaseClass)),
-          null,
-          Option(caseClassToInsertOp(tableCaseClass)),
-          null,
-          Option(caseClassToDeleteOp(tableCaseClass)),
-          null,
-          caseClassToGetByIdOp(tableCaseClass),
-          null
-        )
-      } else {
-        TableAPI(
-          tableCaseClass,
-          None,
-          None,None, None,None, None, None, Nil
-        )
-      }
-    }
-  }
-
-
-
-
 
   def fieldTypeToTspeName(fieldType: __Type, acc: String): String = {
     fieldType.ofType match {
-      case Some(value) => fieldTypeToTspeName(value, s"$acc ${fieldType.kind.toString} of ")
+      case Some(value) =>
+        fieldTypeToTspeName(value, s"$acc ${fieldType.kind.toString} of ")
       case None =>
-        s"""$acc ${fieldType.kind.toString} named ${fieldType.name.getOrElse("WTF")}"""
+        s"""$acc ${fieldType.kind.toString} named ${fieldType.name.getOrElse(
+          "WTF"
+        )}"""
     }
   }
 
-
-  def checkListMatches(field: CField, extension: ObjectExtension): Boolean = {
+  def checkListMatches(
+      field: CField,
+      extension: Version2.ObjectExtension
+  ): Boolean = {
 
     val typeName = Util.extractTypeName(field.fieldType)
 
-    val res = typeName.contentEquals(extension.objectName) //&& field.fields.exists(_.name.contentEquals(extension.field.fieldName))
+    val res = typeName.contentEquals(
+      extension.objectName
+    ) //&& field.fields.exists(_.name.contentEquals(extension.field.fieldName))
     println(s"CHECK MATCHES OBJECT $typeName = ${extension.objectName} -> $res")
     res
   }
 
-
-
-  def parseExtensions(extensionFileLocation: java.io.File): String =  {
-    if(!extensionFileLocation.exists()) ""
+  def parseExtensions(extensionFileLocation: java.io.File): String = {
+    if (!extensionFileLocation.exists()) ""
     else {
       val source = Source.fromFile(extensionFileLocation.toURI, "UTF-8")
       (for {
@@ -1930,92 +2461,144 @@ object PostgresSniffer {
 
   def objectsInDocument(doc: Document): List[ObjectTypeDefinition] = {
     doc.definitions.flatMap {
-      case definition: Definition.ExecutableDefinition => Nil
-      case definition: TypeSystemDefinition => definition match {
-        case TypeSystemDefinition.SchemaDefinition(directives, query, mutation, subscription) =>  Nil
-        case TypeSystemDefinition.DirectiveDefinition(description, name, args, locations) => Nil
-        case definition: TypeDefinition => definition match {
-          case t @ TypeDefinition.ObjectTypeDefinition(description, name, implements, directives, fields) =>
-            Option(t)
-          case TypeDefinition.InterfaceTypeDefinition(description, name, directives, fields) => Nil
-          case TypeDefinition.InputObjectTypeDefinition(description, name, directives, fields) => Nil
-          case TypeDefinition.EnumTypeDefinition(description, name, directives, enumValuesDefinition) => Nil
-          case TypeDefinition.UnionTypeDefinition(description, name, directives, memberTypes) => Nil
-          case TypeDefinition.ScalarTypeDefinition(description, name, directives) => Nil
+      case definition: TypeSystemDefinition =>
+        definition match {
+          case definition: TypeDefinition =>
+            definition match {
+              case t: TypeDefinition.ObjectTypeDefinition =>
+                Option(t)
+              case _ => Nil
+            }
+          case _ => Nil
         }
-      }
-      case extension: Definition.TypeSystemExtension => Nil
+      case _ => Nil
     }
   }
 
-  def docToObjectExtension(doc: Document): List[ObjectExtension]= {
+  def docToObjectExtension(doc: Document): List[Version2.ObjectExtension] = {
     val objectDefinitions = doc.definitions.flatMap {
-      case definition: Definition.ExecutableDefinition => Nil
-      case definition: TypeSystemDefinition => definition match {
-        case TypeSystemDefinition.SchemaDefinition(directives, query, mutation, subscription) =>  Nil
-        case TypeSystemDefinition.DirectiveDefinition(description, name, args, locations) => Nil
-        case definition: TypeDefinition => definition match {
-          case TypeDefinition.ObjectTypeDefinition(description, name, implements, directives, fields) =>
-            val objectExtensionsFields = fields.map { field =>
-              val requiredFields = field.directives.filter(_.name == "requires").map(_.arguments.values.head.toInputString.replaceAllLiterally("\"", ""))
-              val isExternla = field.directives.exists(_.name.contentEquals("external"))
-              val tpe = typeToScalaType(field.ofType, external = isExternla)
-              ObjectExtensionField(fieldName = field.name, fieldType = tpe, requiredFields = requiredFields, isExternla)
-            }
+      case definition: TypeSystemDefinition =>
+        definition match {
 
-            objectExtensionsFields.map { objectExtensionsField =>
-              ObjectExtension(name, objectExtensionsField)
+          case definition: TypeDefinition =>
+            definition match {
+              case TypeDefinition.ObjectTypeDefinition(
+                    description,
+                    name,
+                    implements,
+                    directives,
+                    fields
+                  ) =>
+                val objectExtensionsFields = fields.map { field =>
+                  val requiredFields = field.directives
+                    .filter(_.name == "requires")
+                    .map(
+                      _.arguments.values.head.toInputString
+                        .replaceAllLiterally("\"", "")
+                    )
+                  val isExternla =
+                    field.directives.exists(_.name.contentEquals("external"))
+                  val tpe =
+                    typeToScalaTypeV2(field.ofType, external = isExternla)
+                  ObjectField(
+                    fieldName = field.name,
+                    tpe = tpe,
+                    requiredFields = requiredFields,
+                    isExternla
+                  )
+                }
+
+                objectExtensionsFields.map { objectExtensionsField =>
+                  Version2.ObjectExtension(name, objectExtensionsField)
+                }
+              case _ => Nil
             }
-          case TypeDefinition.InterfaceTypeDefinition(description, name, directives, fields) => Nil
-          case TypeDefinition.InputObjectTypeDefinition(description, name, directives, fields) => Nil
-          case TypeDefinition.EnumTypeDefinition(description, name, directives, enumValuesDefinition) => Nil
-          case TypeDefinition.UnionTypeDefinition(description, name, directives, memberTypes) => Nil
-          case TypeDefinition.ScalarTypeDefinition(description, name, directives) => Nil
+          case _ => Nil
         }
-      }
-      case extension: Definition.TypeSystemExtension => Nil
+      case _ => Nil
+    }
+    objectDefinitions
+  }
+
+  def docToObjectExtensionV2(doc: Document): List[Version2.ObjectExtension] = {
+    val objectDefinitions = doc.definitions.flatMap {
+      case definition: TypeSystemDefinition =>
+        definition match {
+          case definition: TypeDefinition =>
+            definition match {
+              case obj: TypeDefinition.ObjectTypeDefinition =>
+                val objectExtensionsFields = obj.fields.map { field =>
+                  val requiredFields = field.directives
+                    .filter(_.name == "requires")
+                    .map(
+                      _.arguments.values.head.toInputString
+                        .replaceAllLiterally("\"", "")
+                    )
+                  val isExternla =
+                    field.directives.exists(_.name.contentEquals("external"))
+                  val tpe =
+                    typeToScalaTypeV2(field.ofType, external = isExternla)
+                  Version2.ObjectField(
+                    fieldName = field.name,
+                    tpe = tpe,
+                    requiredFields = requiredFields,
+                    isExternla
+                  )
+                }
+
+                objectExtensionsFields.map { objectExtensionsField =>
+                  Version2.ObjectExtension(obj.name, objectExtensionsField)
+                }
+              case _ => Nil
+            }
+        }
+      case _ => Nil
     }
     objectDefinitions
   }
 
   def docToFederatedInstances(doc: Document): List[ExternalEntity] = {
     doc.definitions.flatMap {
-      case definition: Definition.ExecutableDefinition => Nil
-      case definition: TypeSystemDefinition => Nil
-      case extension: Definition.TypeSystemExtension => extension match {
-        case TypeSystemExtension.SchemaExtension(directives, query, mutation, subscription) => Nil
-        case extension: TypeSystemExtension.TypeExtension => extension match {
-          case TypeExtension.ScalarTypeExtension(name, directives) => Nil
-          case TypeExtension.ObjectTypeExtension(name, implements, directives, fields) =>
-            val externalFields = fields.map { field =>
-              ExternalField(field.name, field.ofType, field.directives.exists(_.name.contentEquals("external")))
+      case extension: Definition.TypeSystemExtension =>
+        extension match {
+          case extension: TypeSystemExtension.TypeExtension =>
+            extension match {
+              case TypeExtension.ScalarTypeExtension(name, directives) => Nil
+              case TypeExtension.ObjectTypeExtension(
+                    name,
+                    implements,
+                    directives,
+                    fields
+                  ) =>
+                val externalFields = fields.map { field =>
+                  ExternalField(
+                    field.name,
+                    field.ofType,
+                    field.directives.exists(_.name.contentEquals("external"))
+                  )
+                }
+                val keys = directives
+                  .find(_.name.contentEquals("key"))
+                  .flatMap(
+                    _.arguments
+                      .get("fields")
+                  )
+                  .map(_.toInputString.replaceAllLiterally("\n", ""))
+                  .toList
+                  .flatMap(_.split(" "))
+
+                List(ExternalEntity(name, externalFields, keys))
+              case _ => Nil
             }
-            val keys = directives
-              .find(_.name.contentEquals("key"))
-              .flatMap(_.arguments
-                .get("fields"))
-              .map(_.toInputString.replaceAllLiterally("\n", ""))
-              .toList
-              .flatMap(_.split(" "))
-
-            val caseClassFields = fields.map{field =>
-              codegen.Field(field.name, Reference(() => federatedGraphqlTypeToScalaType(field.ofType)), false, false, Nil, false)
-            }
-
-            typeMap.put(name,CaseClassType(name, caseClassFields, externalKeys = Option(keys.mkString(" "))))
-
-            List(ExternalEntity(name, externalFields, keys))
-          case TypeExtension.InterfaceTypeExtension(name, directives, fields) => Nil
-          case TypeExtension.UnionTypeExtension(name, directives, memberTypes) => Nil
-          case TypeExtension.EnumTypeExtension(name, directives, enumValuesDefinition) => Nil
-          case TypeExtension.InputObjectTypeExtension(name, directives, fields) => Nil
         }
-      }
+      case _ => Nil
     }
   }
 
-
-  def checkExtensionValid(extensions: List[ObjectExtension], baseApi: Document): List[String] = {
+  def checkExtensionValid(
+      extensions: List[Version2.ObjectExtension],
+      baseApi: Document
+  ): List[String] = {
     val objectsInBaseDoc = objectsInDocument(baseApi)
     extensions.flatMap { extension =>
       objectsInBaseDoc.find(_.name.contentEquals(extension.objectName)) match {
@@ -2023,17 +2606,25 @@ object PostgresSniffer {
           extension.field.requiredFields.flatMap { requiredField =>
             baseObject.fields.find(_.name.contentEquals(requiredField)) match {
               case Some(requiredFieldOnBaseObject) =>
-                val extensionFieldNullable = extension.field.fieldType match {
-                  case containerType: ContainerType => containerType match {
-                    case ListType(elementType) => false
-                    case OptionType(elementType) => true
-                  }
+                val extensionFieldNullable = extension.field.tpe match {
+                  case containerType: ContainerType =>
+                    containerType match {
+                      case _: ScalaList   => false
+                      case _: ScalaOption => true
+                    }
                   case _ => false
                 }
-                if(!extensionFieldNullable && requiredFieldOnBaseObject.ofType.nullable) List(s"Object ${baseObject.name} has been extended with field ${extension.field.fieldName} with a nonnullable type. This field requires ${requiredFieldOnBaseObject.name} which is nullable. This does not fly.")
+                if (
+                  !extensionFieldNullable && requiredFieldOnBaseObject.ofType.nullable
+                )
+                  List(
+                    s"Object ${baseObject.name} has been extended with field ${extension.field.fieldName} with a nonnullable type. This field requires ${requiredFieldOnBaseObject.name} which is nullable. This does not fly."
+                  )
                 else Nil
               case None =>
-                List(s"Obejct ${baseObject.name} does not have required field ${requiredField} needed for ${extension.field.fieldName}")
+                List(
+                  s"Obejct ${baseObject.name} does not have required field ${requiredField} needed for ${extension.field.fieldName}"
+                )
             }
           }
         case None => List(s"Object ${extension.objectName} does not exist")
@@ -2042,129 +2633,71 @@ object PostgresSniffer {
   }
 }
 
-object Codegen extends App{
+object Codegen extends App {
   import PostgresSniffer._
   val _ = classOf[org.postgresql.Driver]
   val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+  implicit val conn =
+    DriverManager.getConnection(con_str, "postgres", "postgres")
 
-  val fileLocation = File("") / "src" / "main"/ "scala"
+  val fileLocation = File("") / "src" / "main" / "scala"
   val dir = File(fileLocation) / "generated"
 
   //dir.createDirectory()
 
   val outputFile = dir / "boilerplate.scala"
 
-
 }
 
-object Extensions extends App {
-  import PostgresSniffer._
-  val _ = classOf[org.postgresql.Driver]
-  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
-
-  val tables = connToTables(conn)
-
-  val extensionsFile = File("") / "lib" / "src" / "main"/ "resources" / "extensions.graphql"
-
-  val extensionDoc = parseDocument(parseExtensions(new java.io.File(extensionsFile.toURI)))
-  val federatedStuff = docToFederatedInstances(extensionDoc)
-  val extensions = docToObjectExtension(extensionDoc)
-
-  extensions.foreach(println)
-
-
-
-  federatedStuff.foreach(println)
-
-  println(to2CalibanBoilerPlate(tablesToTableAPI(tables, extensions), extensions, tables, federatedStuff))
-
-//  val baseApi = to2CalibanBoilerPlate(tablesToTableAPI(tables),extensions,tables)
-//
-//    println(baseApi)
-//
-//  val fileLocation = File("") / "lib" / "src" / "main"/ "scala"
-//  val dir = File(fileLocation) / "codegen2"
-//
-//  dir.createDirectory()
-//
-//  val outputFile = dir / "boilerplate.scala"
-//
-//  val generatedBoilerPlate = to2CalibanBoilerPlate(tablesToTableAPI(tables), extensions, tables)
-//
-//  outputFile.toFile.writeAll("package codegen2 \n",generatedBoilerPlate)
-}
-
-
-object Render2 extends App {
-  import PostgresSniffer._
-  val _ = classOf[org.postgresql.Driver]
-  val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
-
-  val tables = connToTables(conn)
-
-  val extensionsFile = File("") / "lib" / "src" / "main"/ "resources" / "extensions.graphql"
-
-  val extensionDoc = parseDocument(parseExtensions(new java.io.File(extensionsFile.toURI)))
-  val extensions = docToObjectExtension(extensionDoc)
-  val externalEntities = docToFederatedInstances(extensionDoc)
-
-  val baseApi = to2CalibanBoilerPlate(tablesToTableAPI(tables, extensions),extensions,tables, externalEntities)
-
-//  println(baseApi)
-
-  val fileLocation = File("") / "lib" / "src" / "main"/ "scala"
-  val dir = File(fileLocation) / "codegen2"
-
-  //dir.createDirectory()
-
-  val outputFile = dir / "boilerplate.scala"
-
-  val generatedBoilerPlate = to2CalibanBoilerPlate(tablesToTableAPI(tables, extensions), extensions, tables, externalEntities)
-
-  outputFile.toFile.writeAll("package codegen2 \n",generatedBoilerPlate)
-}
-//
 object Poker extends App {
   import PostgresSniffer._
   val _ = classOf[org.postgresql.Driver]
   val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
-  implicit val conn = DriverManager.getConnection(con_str, "postgres", "postgres")
+  implicit val conn =
+    DriverManager.getConnection(con_str, "postgres", "postgres")
 
   val metadata = conn.getMetaData
 
-
-  val procedures = results(metadata.getProcedures(null, null, null))(extractProcedures)
+  val procedures =
+    results(metadata.getProcedures(null, null, null))(extractProcedures)
 
   println(s"PROCEDURES: ${procedures.size}")
 
   val proceduresWithColumns = procedures.map { procedure =>
-    procedure -> results(metadata.getProcedureColumns(null, null, procedure.name, null))(extractProcedureColumns)
+    procedure -> results(
+      metadata.getProcedureColumns(null, null, procedure.name, null)
+    )(extractProcedureColumns)
   }
 
   proceduresWithColumns.foreach { case (procedure, columns) =>
     println(s"Procedure: ${procedure.name}")
     columns.foreach { column =>
-      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType}")
+      println(
+        s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType}"
+      )
     }
   }
 
-  val functions = results(metadata.getFunctions(null, null, null))(extractFunctions)
+  val functions =
+    results(metadata.getFunctions(null, null, null))(extractFunctions)
 
   println(s"FUNCTIONS: ${functions.size}")
 
-  val functionsWithColumns = functions.filter(_.name.contentEquals("user_extended_info")).map { function =>
-    function -> results(metadata.getFunctionColumns(null, null, function.name, null))(extractFunctionColumns)
-  }
+  val functionsWithColumns =
+    functions.filter(_.name.contentEquals("user_extended_info")).map {
+      function =>
+        function -> results(
+          metadata.getFunctionColumns(null, null, function.name, null)
+        )(extractFunctionColumns)
+    }
 
   functionsWithColumns.foreach { case (procedure, columns) =>
     println(s"Function: ${procedure.name}")
     columns.foreach { column =>
-      println(s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType} -> ${column.typeName}")
+      println(
+        s"  ${column.columnName} -> ${column.columnType} -> ${column.dataType} -> ${column.typeName}"
+      )
     }
   }
 
 }
-

@@ -1,5 +1,5 @@
 {
-  "get_product_by_id": {
+  "getproductById": {
     "name": "Table",
     "upc": "1",
     "weight": 100,
