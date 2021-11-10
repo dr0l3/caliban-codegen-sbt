@@ -1,0 +1,12 @@
+{
+  "create_product_bulk": [
+    {
+      "upc": "90",
+      "name": "Picture"
+    },
+    {
+      "upc": "91",
+      "name": "Bin"
+    }
+  ]
+}

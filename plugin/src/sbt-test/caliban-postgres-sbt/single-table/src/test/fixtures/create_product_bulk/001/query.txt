@@ -1,0 +1,6 @@
+mutation bulkInsert {
+  create_product_bulk(value: [{upc:"90", name:"Picture", price:10, weight:2}, {upc:"91", name:"Bin", price:2, weight:2}]) {
+    upc
+    name
+  }
+}

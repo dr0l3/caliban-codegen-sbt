@@ -1,0 +1,14 @@
+{
+  "a": {
+    "upc": "90",
+    "name": "Picture",
+    "price": 10,
+    "weight": 2
+  },
+  "b": {
+    "upc": "91",
+    "name": "Bin",
+    "price": 2,
+    "weight": 2
+  }
+}

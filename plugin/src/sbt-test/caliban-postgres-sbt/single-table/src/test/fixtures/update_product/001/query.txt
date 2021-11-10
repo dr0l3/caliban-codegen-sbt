@@ -1,0 +1,8 @@
+mutation update {
+  update_product_by_pk(pk:{upc: "1"}, update: {weight: 9001}) {
+    upc
+    name
+    price
+    weight
+  }
+}

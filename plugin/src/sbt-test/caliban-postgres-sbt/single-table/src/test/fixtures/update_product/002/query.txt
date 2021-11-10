@@ -1,0 +1,8 @@
+{
+ getproductById(upc: "1") {
+  upc
+  name
+  price
+  weight
+ }
+}

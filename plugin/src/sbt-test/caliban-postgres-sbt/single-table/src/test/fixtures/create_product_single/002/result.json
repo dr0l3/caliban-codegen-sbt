@@ -1,0 +1,8 @@
+{
+  "getproductById": {
+    "name": "Plant",
+    "upc": "99",
+    "weight": 5,
+    "price": 25
+  }
+}

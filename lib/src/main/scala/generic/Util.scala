@@ -534,9 +534,7 @@ object Util {
       tables: List[Whatever.Table],
       extensions: ExtensionLogicMap,
       connection: Connection,
-      mutationToInsertReader: Map[String, Json => String],
-      mutationToUpdateReader: Map[String, Json => String],
-      mutationToDeleteReader: Map[String, Json => String]
+      mutationOpByFieldName: Map[String, Field => String]
   )(field: Field): Step[R] = QueryStep(ZQuery.fromEffect(ZIO {
 
     // We have created an intermediate that has filtered out all the fields that have @requires
@@ -544,17 +542,7 @@ object Util {
       toIntermediateV2v2(field, tables, "root", extensions.map(_._1).toList, false, Nil)
 
     // Three types
-    val (mutationPart) = if (field.name.startsWith("update")) {
-      mutationToUpdateReader(field.name)(field.arguments.asJson)
-    } else if (field.name.startsWith("insert")) {
-      inputValueToInsertStatement(
-        field.arguments,
-        extractTypeName(field.fieldType)
-      )
-    } else {
-      mutationToDeleteReader(field.name)(field.arguments.asJson)
-    }
-
+    val mutationPart = mutationOpByFieldName(field.name)(field)
 
     val patchedIntermediate: IntermediateV2 = intermediate match {
       case reg: IntermediateV2Regular => reg.copy(from = reg.from.copy(tableName = "mutation_result"))
@@ -563,8 +551,6 @@ object Util {
 
     val readPartOfQuery = intermdiateV2ToSQL(
       patchedIntermediate,
-//      "root",
-//      None
     )
 
     val fullQuery = s"""
@@ -573,6 +559,8 @@ object Util {
                        |$readPartOfQuery
                        |
                        |""".stripMargin
+    println(fullQuery)
+
 
     val coordinatesForTypenameQueries = checkForTypenameQuery(field, Nil).map {
       case (path, tpe) => path -> tpe
@@ -1131,9 +1119,7 @@ object Util {
       connection: Connection,
       extensions: ExtensionLogicMap,
       tables: List[Whatever.Table],
-      mutationToInsertReader: Map[String, Json => String],
-      mutationToUpdateReader: Map[String, Json => String],
-      mutationToDeleteReader: Map[String, Json => String]
+      mutationOnByFieldName: Map[String, Field => String]
   )(implicit schema: Schema[R, S]): Operation[R] = {
     val tpe = schema.toType_()
 
@@ -1146,9 +1132,7 @@ object Util {
             tables,
             extensions,
             connection,
-            mutationToInsertReader,
-            mutationToUpdateReader,
-            mutationToDeleteReader
+            mutationOnByFieldName
           )
         )
       )

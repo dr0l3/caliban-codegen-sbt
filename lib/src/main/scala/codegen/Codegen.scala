@@ -1,9 +1,6 @@
 package codegen
 
-import caliban.parsing.adt.Definition.{
-  TypeSystemDefinition,
-  TypeSystemExtension
-}
+import caliban.parsing.adt.Definition.{TypeSystemDefinition, TypeSystemExtension}
 import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition
 import caliban.parsing.adt.Definition.TypeSystemDefinition.TypeDefinition.ObjectTypeDefinition
 import caliban.parsing.adt.Definition.TypeSystemExtension.TypeExtension
@@ -11,41 +8,24 @@ import caliban.parsing.adt.{Definition, Directive, Document, Type}
 import caliban._
 import caliban.execution.{Field => CField}
 import caliban.federation.{EntityResolver, federate}
-import caliban.introspection.adt.{
-  __DeprecatedArgs,
-  __Directive,
-  __Field,
-  __InputValue,
-  __Type,
-  __TypeKind
-}
+import caliban.introspection.adt.{__DeprecatedArgs, __Directive, __Field, __InputValue, __Type, __TypeKind}
 import caliban.parsing.{ParsedDocument, Parser, SourceMapper}
 import caliban.schema.Step.{MetadataFunctionStep, ObjectStep, PureStep}
 import caliban.schema.{Operation, RootSchemaBuilder, Schema, Step, Types}
 import caliban.wrappers.Wrapper
 import cats.Applicative
 import codegen.Util.{extractTypeName, typeToScalaTypeV2}
-import codegen.Version2.{
-  CaseClassType2,
-  ContainerType,
-  Field2,
-  Method2,
-  MethodParam,
-  ObjectField,
-  ScalaInt,
-  ScalaList,
-  ScalaOption,
-  ScalaString,
-  ScalaUUID,
-  createRelationshipFields2,
-  globalTypeMap
-}
+import codegen.Version2.{AbstractEffect, CaseClassType2, ContainerType, Field2, Method2, MethodParam, ObjectField, ScalaInt, ScalaList, ScalaOption, ScalaString, ScalaType, ScalaUUID, createRelationshipFields2, globalTypeMap}
 import generic.Util.{ExtensionPosition, genericQueryHandler, printType}
 import io.circe.Decoder
 import zio.NonEmptyChunk
 
+import java.{sql, util}
+import java.sql.{Blob, CallableStatement, Clob, DatabaseMetaData, NClob, PreparedStatement, SQLWarning, SQLXML, Savepoint, Statement, Struct}
 import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
+import java.util.Properties
+import java.util.concurrent.Executor
 //import codegen.Runner.api
 import fastparse.parse
 import io.circe.optics.JsonPath.root
@@ -260,12 +240,14 @@ case class Column(
   def matchesName(name: String): Boolean = this.name.contentEquals(name)
 
   def toScalaType(): Version2.ScalaType = {
-    sqltype match {
+    val baseType = sqltype match {
       case 4    => ScalaInt
       case 12   => ScalaString
       case 1111 => ScalaUUID
       case 93   => ScalaZonedDataTime
     }
+
+    if (nullable) ScalaOption(baseType) else baseType
   }
 }
 
@@ -352,14 +334,52 @@ object Whatever {
 
     def toUnifiedModel(tables: List[Whatever.Table]): Version2.ScalaType
 
+    def toCreateFieldName(): String = s"create_${name}"
     def toCreateField(tables: List[Whatever.Table]): Field2 = {
       val argClass = extractCreateInput
       Field2(
-        s"create_${name}",
+        toCreateFieldName(),
         ScalaOption(toUnifiedModel(tables)),
         Nil,
         List(MethodParam("args", argClass))
       )
+    }
+
+    def toInsert(field: CField): String = {
+      val (cols, values) = tableColumns.flatMap { col =>
+        CodegenUtils
+          .extractColumnValueFromInputValue(col, field.arguments)
+          .map(value => col.name -> value)
+      }.unzip
+      s"insert into $name(${cols.mkString(", ")}) values(${values.mkString(", ")})"
+    }
+
+    def toBulkCreateFieldName(): String = s"create_${name}_bulk"
+    def toBulkCreateField(tables: List[Whatever.Table]): Field2 = {
+      val argClass = extractCreateInput
+      Field2(
+        toBulkCreateFieldName(),
+        ScalaList(toUnifiedModel(tables)),
+        Nil,
+        List(MethodParam("args", ScalaList(argClass)))
+      )
+    }
+
+    def toBulkInsert(field: CField): String = {
+      println(field.arguments)
+
+      val (cols, values) = tableColumns.map { col =>
+        col.name -> CodegenUtils.extractColumnValueFromInputValueWithList(
+          col,
+          field.arguments
+        )
+      }.unzip
+
+      val valuesFormatted = values
+        .transpose
+        .map(list => list.mkString("(", ",", ")")).mkString("values", ",", "")
+
+      s"insert into $name(${cols.mkString(",")}) $valuesFormatted"
     }
   }
   case class PrimaryKeyTable(
@@ -516,6 +536,71 @@ object Whatever {
 
       s"limit $pageSize"
     }
+
+    def toUpdateByIdFieldName(): String = s"update_${name}_by_pk"
+
+    def toUpdateArg(): CaseClassType2 = {
+      CaseClassType2(
+        s"update_${name}_input",
+        otherColumns.map { col =>
+          val tpe = ScalaType.unwrap(col.toScalaType())
+          Field2(col.name, ScalaOption(tpe), Nil, Nil)
+        },
+        Nil,
+        Nil
+      )
+    }
+
+    def toUpdateArgHolder(): CaseClassType2 =  {
+      CaseClassType2(
+        s"update_${name}_args",
+        List(
+          Field2("pk", toPk(), Nil, Nil),
+          Field2("update", toUpdateArg(), Nil, Nil)
+        ),
+        Nil,
+        Nil
+      )
+    }
+
+    def toUpdateByIdField(tables: List[Whatever.Table]): Field2 = {
+      val argClass = toUpdateArgHolder()
+      Field2(
+        toUpdateByIdFieldName(),
+        toUnifiedModel(tables),
+        Nil,
+        List(MethodParam("args", argClass))
+      )
+    }
+
+    def toUpdate(field: CField): String = {
+      val where = primaryKeys.toList.flatMap { col =>
+        val zomg = field.arguments.get("pk") match {
+          case Some(value) => value match {
+            case InputValue.ObjectValue(fields) => fields
+            case _ => Map[String, InputValue]()
+          }
+          case None => Map[String, InputValue]()
+        }
+        CodegenUtils.extractColumnValueFromObject(col, zomg)
+      } match {
+        case Nil => ""
+        case list => list.mkString(" AND ")
+      }
+
+      val updates = otherColumns.flatMap { col =>
+        val moreZomg = field.arguments.get("update") match {
+          case Some(value) => value match {
+            case InputValue.ObjectValue(fields) => fields
+            case _ => Map[String, InputValue]()
+          }
+          case None => Map[String, InputValue]()
+        }
+        CodegenUtils.extractColumnUpdateFromInputValue(col, moreZomg).map(value => s"${col.name} = $value")
+      }.mkString(", ")
+
+      s"update $name set $updates where $where"
+    }
   }
   case class NonPrimaryKeyTable(
       name: String,
@@ -640,7 +725,7 @@ object CodegenUtils {
       s"extractColumnsValueFromFederatedArguments: ${column.name}. $input $columnValuesAsJson"
     )
 
-    column.toScalaType() match {
+    ScalaType.unwrap(column.toScalaType()) match {
       case baseType: Version2.BaseType =>
         baseType match {
           case Version2.ScalaInt =>
@@ -670,6 +755,146 @@ object CodegenUtils {
     }
   }
 
+  def extractColumnValueFromInputValueWithList(
+      column: Column,
+      inputValue: Map[String, InputValue]
+  ): List[String] = {
+
+    val json =
+      inputValue
+        .get("value")
+        .map(_.asJson(InputValue.circeEncoder))
+        .flatMap(_.asArray)
+        .getOrElse(Nil)
+        .toList
+        .flatMap(_.asObject)
+        .flatMap(_.apply(column.name))
+
+    println(
+      s"extractColumnValueFromInputValue: ${column.name}. $inputValue $json"
+    )
+    ScalaType.unwrap(column.toScalaType()) match {
+      case baseType: Version2.BaseType =>
+        baseType match {
+          case Version2.ScalaInt =>
+            json
+              .map(_.as[Int].toOption.map(int => s"$int").getOrElse("null"))
+          case Version2.ScalaString =>
+            json
+              .map(
+                _.as[String].toOption
+                  .map(string => s"'$string'")
+                  .getOrElse("null")
+              )
+
+          case Version2.ScalaUUID =>
+            json.map(
+              _.as[UUID].toOption
+                .map(uuid => s"'${uuid.toString}'")
+                .getOrElse("null")
+            )
+
+          case Version2.ScalaZonedDataTime =>
+            json
+              .map(
+                _.as[ZonedDateTime].toOption
+                  .map(dt =>
+                    s"'${dt.format(DateTimeFormatter.ISO_ZONED_DATE_TIME)}'"
+                  )
+                  .getOrElse("null")
+              )
+
+        }
+      case _ => Nil
+    }
+  }
+
+  def extractColumnUpdateFromInputValue(
+                                        column: Column,
+                                        inputValue: Map[String, InputValue]
+                                      ): Option[String] = {
+
+    val json =
+      inputValue.get(column.name).map(_.asJson(InputValue.circeEncoder))
+
+    println(
+      s"extractColumnUpdateFromInputValue: ${column.name}. $inputValue $json"
+    )
+    ScalaType.unwrap(column.toScalaType()) match {
+      case baseType: Version2.BaseType =>
+        baseType match {
+          case Version2.ScalaInt =>
+            json match {
+              case Some(value) => if(value.isNull) Option("null") else value.as[Int].toOption.map(int => s"$int")
+              case None => None
+            }
+          case Version2.ScalaString =>
+            json match {
+              case Some(value) => if(value.isNull) Option("null") else value.as[String].toOption.map(string => s"'$string'")
+              case None => None
+            }
+
+          case Version2.ScalaUUID =>
+            json match {
+              case Some(value) => if(value.isNull) Option("null") else value.as[UUID].toOption.map(uuid => s"'${uuid.toString}'")
+              case None => None
+            }
+
+          case Version2.ScalaZonedDataTime =>
+            json match {
+              case Some(value) => if(value.isNull) Option("null") else value.as[ZonedDateTime].toOption.map(dt =>
+                s"'${dt.format(DateTimeFormatter.ISO_ZONED_DATE_TIME)}'"
+              )
+              case None => None
+            }
+        }
+      case _ => None
+    }
+  }
+
+  def extractColumnValueFromInputValue(
+      column: Column,
+      inputValue: Map[String, InputValue]
+  ): Option[String] = {
+
+    val json =
+      inputValue.get(column.name).map(_.asJson(InputValue.circeEncoder))
+
+    println(
+      s"extractColumnValueFromInputValue: ${column.name}. $inputValue $json"
+    )
+    ScalaType.unwrap(column.toScalaType()) match {
+      case baseType: Version2.BaseType =>
+        baseType match {
+          case Version2.ScalaInt =>
+            json.flatMap(
+              _.as[Int].toOption.map(int => s"$int")
+            )
+          case Version2.ScalaString =>
+            json.flatMap(
+              _.as[String].toOption
+                .map(string => s"'$string'")
+            )
+
+          case Version2.ScalaUUID =>
+            json.flatMap(
+              _.as[UUID].toOption
+                .map(uuid => s"'${uuid.toString}'")
+            )
+
+          case Version2.ScalaZonedDataTime =>
+            json.flatMap(
+              _.as[ZonedDateTime].toOption
+                .map(dt =>
+                  s"'${dt.format(DateTimeFormatter.ISO_ZONED_DATE_TIME)}'"
+                )
+            )
+
+        }
+      case _ => None
+    }
+  }
+
   def extractColumnValueFromObject(
       column: Column,
       inputValue: Map[String, InputValue]
@@ -679,7 +904,7 @@ object CodegenUtils {
       inputValue.get(column.name).map(_.asJson(InputValue.circeEncoder))
 
     println(s"extractColumnValueFromObject: ${column.name}. $inputValue $json")
-    column.toScalaType() match {
+    ScalaType.unwrap(column.toScalaType()) match {
       case baseType: Version2.BaseType =>
         baseType match {
           case Version2.ScalaInt =>
@@ -720,7 +945,7 @@ object CodegenUtils {
       .asObject
       .flatMap(_.apply(pk.name))
     println(s"PK: $pk INPUT: $inputValue PKFIELD: $pkField")
-    pk.scalaType match {
+    ScalaType.unwrap(pk.scalaType) match {
       case baseType: Version2.BaseType =>
         baseType match {
           case Version2.ScalaInt =>
@@ -812,6 +1037,23 @@ object Version2 {
 
     def renderSelf: String
   }
+
+  object ScalaType {
+    def unwrap(tpe: ScalaType): ScalaType = {
+      tpe match {
+        case baseType: BaseType => baseType
+        case containerType: ContainerType =>
+          containerType match {
+            case ScalaOption(inner)    => unwrap(inner)
+            case ScalaList(inner)      => unwrap(inner)
+            case AbstractEffect(inner) => unwrap(inner)
+          }
+        case c: CaseClassType2  => c
+        case TypeReference(tpe) => unwrap(tpe())
+      }
+    }
+  }
+
   sealed trait BaseType extends ScalaType {
     override def render(effect: EffectWrapper): String = name
 
@@ -1061,8 +1303,7 @@ object Version2 {
 
   case class CalibanAPI(
       models: List[CaseClassType2],
-      args: List[CaseClassType2],
-      outputTypes: List[CaseClassType2],
+      inputOutputTypes: List[CaseClassType2],
       federationArgs: List[(Whatever.Table, CaseClassType2)],
       implicits: List[String], // <- given implicitly really, pun intended
       queryRoot: CaseClassType2,
@@ -1072,22 +1313,26 @@ object Version2 {
       extensions: ScalaTrait,
       extensionArgTypes: List[CaseClassType2],
       tables: List[Whatever.Table],
-      objectExtensions: List[ObjectExtension]
+      objectExtensions: List[ObjectExtension],
+      mutationOps: List[
+        (String, String, String)
+      ] //Tablename, fieldName, methodName
   ) {
     def render(effectWrapper: EffectWrapper): String = {
       val renderedModels = models.map(_.render(effectWrapper)).mkString("\n")
       val renderedArgs =
-        args.distinct.map(_.render(effectWrapper)).mkString("\n")
-      val renderedOutputTypes =
-        outputTypes.distinct.map(_.render(effectWrapper)).mkString("\n")
+        inputOutputTypes.distinct.map(_.render(NoEffectWrapper)).mkString("\n")
+
       val renderedExtensionArgTypes =
         extensionArgTypes.distinct.map(_.render(effectWrapper)).mkString("\n")
       val renderedImplicits = implicits.distinct.mkString("\n")
       val renderedQueryRoot = queryRoot.render(effectWrapper)
+      val renderedQueryImplicit = ""
       val renderedMutationRoot = mutationRoot.render(effectWrapper)
+      val renderedMutationImplicit = ""
       val renderedUnreachableTypes =
         s"""object UnreachableTypes {
-           |  ${unreachableTypes.map(_.render(effectWrapper)).mkString("\n")}  
+           |  ${unreachableTypes.map(_.render(effectWrapper)).mkString("\n")}
            |}""".stripMargin
       val renderedUnreachablTypeInvocations = unreachableTypes
         .map { tpeCreator =>
@@ -1128,7 +1373,10 @@ object Version2 {
         s"""ExtensionPosition("${extension.objectName}","${extension.field.fieldName}", List($requiredFields)) -> middleGenericJsonObject[$extensionInputType,${extension.field.tpe.name}](extensions.${extensionMethodName})("${extension.field.fieldName}")"""
       }
 
-      val renderedInsertByFieldNameEntries = List("")
+      val renderedInsertByFieldNameEntries = mutationOps.map {
+        case (table, opName, methodName) =>
+          s""""$opName" -> $table.$methodName"""
+      }
       val renderedUpdateByFieldNameEntries = List("")
       val renderedDeleteByFieldNameEntries = List("")
 
@@ -1145,7 +1393,7 @@ object Version2 {
         .mkString(",\n")
 
       val renderedApiClass =
-        s"""class API(extensions: Extensions, connection: Connection)(implicit val querySchema: Schema[Any, Queries], mutationSchema: Schema[Any, Mutations]) {
+        s"""class API(extensions: Extensions, connection: Connection) {
            |   import EntityResolvers._
            |   import UnreachableTypes._
            |   val tables = $renderedTableList
@@ -1156,16 +1404,8 @@ object Version2 {
            |      ${renderedExtensionLogicMapEntries.mkString(",\n")}
            |   )
            |
-           |   val insertByFieldName: Map[String, Json => String] = Map(
+           |   val mutationOnByFieldName: Map[String, Field => String] = Map(
            |      ${renderedInsertByFieldNameEntries.mkString(",\n")}
-           |   )
-           |
-           |   val updateByFieldName: Map[String, Json => String] = Map(
-           |      ${renderedUpdateByFieldNameEntries.mkString(",\n")}
-           |   )
-           |
-           |   val deleteByFieldName: Map[String, Json => String] = Map(
-           |      ${renderedDeleteByFieldNameEntries.mkString(",\n")}
            |   )
            |
            |   val entityResolverConditionByTypeName: Map[String, InputValue => String]= Map(
@@ -1186,9 +1426,7 @@ object Version2 {
            |          connection,
            |          extensionLogicByType,
            |          tables,
-           |          insertByFieldName,
-           |          updateByFieldName,
-           |          deleteByFieldName
+           |          mutationOnByFieldName
            |        )
            |      ),
            |      None
@@ -1214,14 +1452,17 @@ object Version2 {
          |
          |  $renderedArgs
          |
-         |  $renderedOutputTypes
-         |
          |  $renderedExtensionArgTypes
          |
+         |$renderedImplicits
          |
          |$renderedQueryRoot
          |
          |$renderedMutationRoot
+         |
+         |$renderedQueryImplicit
+         |
+         |$renderedMutationImplicit
          |
          |$renderedUnreachableTypes
          |
@@ -1273,7 +1514,7 @@ object Version2 {
       args: List[(String, CaseClassType2)],
       outputTypes: List[CaseClassType2],
       queryFields: List[Field2],
-      mutationFields: List[Field2],
+      mutationFields: List[(Field2, String, String, String)],
       entityResolvers: List[GeneratedMethod],
       extensionTraitMethods: List[Method2],
       entityResolverKeys: List[(Whatever.Table, CaseClassType2)]
@@ -1294,8 +1535,21 @@ object Version2 {
           case c2: Whatever.NonPrimaryKeyTable => c2.toModel(tables)
         }
 
-        val createFields = List(table.toCreateField(tables))
-        val updateFields = Nil
+        val createFields = List(
+          (
+            table.toCreateField(tables),
+            table.name,
+            table.toCreateFieldName(),
+            "toInsert"
+          ),
+          (
+            table.toBulkCreateField(tables),
+            table.name,
+            table.toBulkCreateFieldName(),
+            "toBulkInsert"
+          )
+        )
+        val updateFields = List()
         val deleteFields = Nil
         val mutationFields = createFields ++ updateFields ++ deleteFields
 
@@ -1319,12 +1573,18 @@ object Version2 {
               //TODO: Add more here, possibly based on annotations
             )
 
+            val updateByIdField = List(
+              (prim.toUpdateByIdField(tables), prim.name, prim.toUpdateByIdFieldName(), "toUpdate")
+            )
+            println(s"ZOMOZMOMZOGMZOMGOMOZMGZOMGZ ${updateByIdField.map(_._1.scalaType)}")
+
+
             GeneratedTypes(
               models = List(modelType),
               args = Nil,
               outputTypes = Nil,
               queryFields = queryFields,
-              mutationFields = mutationFields,
+              mutationFields = mutationFields ++ updateByIdField,
               entityResolvers =
                 List(createEntityHandlerMethod(modelType)), // TODO: FIX
               extensionTraitMethods = extensionMethods,
@@ -1347,10 +1607,13 @@ object Version2 {
     val queryRoot =
       CaseClassType2("Queries", generatedTypes.flatMap(_.queryFields), Nil, Nil)
 
+    println("MUTATION FIELDS")
+    generatedTypes.flatMap(_.mutationFields).foreach{case (a,b,c,d) => println(s"$c -> ${a.scalaType}")}
+
     val mutationRoot =
       CaseClassType2(
         "Mutations",
-        generatedTypes.flatMap(_.mutationFields),
+        generatedTypes.flatMap(_.mutationFields).map(v => v._1),
         Nil,
         Nil
       )
@@ -1402,10 +1665,20 @@ object Version2 {
       s"implicit val ${argTpe.name}ArgBuilder = ArgBuilder.gen[${argTpe.name}]"
     }
 
+
+    val reachableTypes = (queryRoot.fields ++ mutationRoot.fields)
+      .flatMap(extractReachableTypes)
+      .foldLeft[List[CaseClassType2]](Nil)((acc, next) => {
+        ScalaType.unwrap(next) match {
+          case c: CaseClassType2 => acc ++ List(c)
+          case _ => acc
+        }
+      })
+      .filterNot(tpe => globalTypeMap.keys.exists(_.contentEquals(tpe.name))) ++ args
+
     CalibanAPI(
       models = generatedTypes.flatMap(_.models),
-      args = args,
-      outputTypes = outputTypes,
+      inputOutputTypes = reachableTypes.distinct,
       implicits = schemaImplicits ++ argbuilderImplicits,
       queryRoot = queryRoot,
       mutationRoot = mutationRoot,
@@ -1415,8 +1688,31 @@ object Version2 {
       extensionArgTypes = extensionArgTypes,
       federationArgs = generatedTypes.flatMap(_.entityResolverKeys),
       tables = tables,
-      objectExtensions = externalExtensions
+      objectExtensions = externalExtensions,
+      mutationOps = generatedTypes.flatMap(v => v.mutationFields).map {
+        case (_, t, opName, methodName) => (t, opName, methodName)
+      }
     )
+  }
+
+  def isComposite(tpe: ScalaType): Boolean = false
+
+  def extractReachableTypes(field2: Field2): List[ScalaType] = {
+    List(field2.scalaType) ++ field2.arguments.map(_.tpe).flatMap(tpe => extractReachableTypes(tpe))
+  }
+
+  def extractReachableTypes(tpe: ScalaType): List[ScalaType] = {
+    tpe match {
+      case baseType: BaseType => List(baseType)
+      case containerType: ContainerType => containerType match {
+        case ScalaOption(inner) => extractReachableTypes(inner)
+        case ScalaList(inner) => extractReachableTypes(inner)
+        case AbstractEffect(inner) => extractReachableTypes(inner)
+      }
+      case c:  CaseClassType2 => List(c) ++ c.fields.flatMap(field => extractReachableTypes(field.scalaType))
+      case TypeReference(tpe) => extractReachableTypes(tpe())
+    }
+
   }
 
   def needsSchema(tpe: ScalaType): Boolean = {
@@ -1838,20 +2134,6 @@ object Util {
       if (rootLevelOfEntityResolver) ObjectResponse
       else fieldToSQLResponseType(field.fieldType, nullable = true)
     val ordering = None
-    val condition =
-      if (rootLevelOfEntityResolver) None
-      else
-        responseType match {
-          case ObjectResponse =>
-            table match {
-              case prim: Whatever.PrimaryKeyTable =>
-                Option(prim.extractSingleItemCondition(field))
-              case noPrim: Whatever.NonPrimaryKeyTable =>
-                None // Should this ever happen? How do we select a single row from a table without a primary key
-            }
-          case ListResponse => Option(table.extractPaginationSizing(field))
-        }
-    println(s"COndition: $condition. ResponseType: $responseType")
 
     val requirementsColumns = requirementsFromExtensions.map(requiredField =>
       IntermediateColumn(requiredField, requiredField)
@@ -1869,14 +2151,26 @@ object Util {
 
     val pagination = responseType match {
       case ObjectResponse => None
-      case ListResponse => Option(table.extractPaginationSizing(field))
+      case ListResponse   => Option(table.extractPaginationSizing(field))
     }
 
     val whereClauseFromField = responseType match {
-      case ObjectResponse => table match {
-        case prim: Whatever.PrimaryKeyTable => Option(prim.extractSingleItemCondition(field))
-        case nonPrim: Whatever.NonPrimaryKeyTable => None
-      }
+      case ObjectResponse =>
+        table match {
+          case prim: Whatever.PrimaryKeyTable =>
+            Option(prim.extractSingleItemCondition(field))
+          // This shouldn't happen for now, but in general needs work
+          // Right now we only expose getById and list operations and only for primary key tables
+          // In order for us to guarantee at most a single item one condition must be satisfied
+          // - We are querying with a where clause on a column with a unique value
+          // This is trivially the case with getById on a primary key table
+          // However this is considerably more complicated if we start supporting expressions.
+          // In general i guess we should always return lists for expressions, because we can't dependently type queries
+          // I guess its possible to expose a list and a single item variant of search with expressions
+          // the single item variant would then be restricted to only allow expressions that can produce a single item
+
+          case _: Whatever.NonPrimaryKeyTable => None
+        }
       case ListResponse => None
     }
 
@@ -1921,7 +2215,9 @@ object Util {
             case list => list.mkString(" where ", " AND ", "")
           }
 
-        println(s"Condition: ${intermediate.where}. Effective: $effectiveCondition. $intermediate")
+        println(
+          s"Condition: ${intermediate.where}. Effective: $effectiveCondition. $intermediate"
+        )
 
         s"""
              |select row_to_json(
@@ -1932,9 +2228,10 @@ object Util {
              |      ) as "json_spec"
              |     )
              |) as "${intermediate.fieldName}"
-             |from (select * from ${reg.from.tableName} $effectiveCondition ${intermediate.pagination.getOrElse("")}) as "$dataId"
+             |from (select * from ${reg.from.tableName} $effectiveCondition ${intermediate.pagination
+          .getOrElse("")}) as "$dataId"
              |    """.stripMargin
-      case union: IntermediateV2Union=>
+      case union: IntermediateV2Union =>
         /*
         select "json_spec"
         from (
@@ -1968,8 +2265,9 @@ object Util {
             "regular table"
           case _ =>
             val last = union.discriminatorMapping.last
-            val nMinusOne = union.discriminatorMapping.filterNot { case (k, _) =>
-              k.contentEquals(last._1)
+            val nMinusOne = union.discriminatorMapping.filterNot {
+              case (k, _) =>
+                k.contentEquals(last._1)
             }
 
             val elseClause = last._2.map { col =>
@@ -2016,7 +2314,8 @@ object Util {
                  |      end as "object"
                  |  ) as "json_spec"
                  |) $subSelect as ${intermediate.fieldName}
-                 |from (select * from ${intermediate.from.tableName} $effectiveCondition ${union.pagination.getOrElse("")}) as "$dataId"
+                 |from (select * from ${intermediate.from.tableName} $effectiveCondition ${union.pagination
+              .getOrElse("")}) as "$dataId"
                  |""".stripMargin
 
         }
@@ -2618,12 +2917,14 @@ object Codegen extends App {
 
 }
 
+
 object Poker extends App {
   import PostgresSniffer._
   val _ = classOf[org.postgresql.Driver]
   val con_str = "jdbc:postgresql://0.0.0.0:5438/product"
   implicit val conn =
     DriverManager.getConnection(con_str, "postgres", "postgres")
+
 
   val metadata = conn.getMetaData
 
@@ -2668,5 +2969,33 @@ object Poker extends App {
       )
     }
   }
+
+}
+
+object SimplePoker extends App {
+  import PostgresSniffer._
+  val _ = classOf[org.postgresql.Driver]
+  val con_str = "jdbc:postgresql://0.0.0.0:6875/materialize"
+  implicit val conn =
+    DriverManager.getConnection(con_str, "materialize", null)
+
+
+  val metadata = conn.getMetaData
+
+
+//  println(metadata.getTableTypes)
+  val res = metadata.getColumns(null, "public", null, null)
+
+  val zomg = results(res)(extractColumn)
+
+  println(zomg)
+//
+//  val res = metadata.getTableTypes
+
+//  while(res.next()) {
+//    (0 to res.getMetaData.getColumnCount).foreach(i => print(s"${res.getObject(i)} "))
+//    println()
+//    println(res.getString("TABLE_TYPE"))
+//  }
 
 }

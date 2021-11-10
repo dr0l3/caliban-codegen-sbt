@@ -1,0 +1,8 @@
+{
+  "create_product": {
+    "upc": "99",
+    "name": "Plant",
+    "price": 25,
+    "weight": 5
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "getproductById": {
+    "name": "Table",
+    "upc": "1",
+    "weight": 9001,
+    "price": 899
+  }
+}

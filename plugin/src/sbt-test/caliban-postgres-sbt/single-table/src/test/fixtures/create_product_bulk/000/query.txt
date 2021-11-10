@@ -1,0 +1,15 @@
+{
+ a: getproductById(upc: "90") {
+  upc
+  name
+  price
+  weight
+ }
+
+ b: getproductById(upc: "91") {
+   upc
+   name
+   price
+   weight
+  }
+}

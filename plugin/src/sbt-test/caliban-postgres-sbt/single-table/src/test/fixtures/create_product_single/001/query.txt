@@ -1,0 +1,8 @@
+mutation insertProduct{
+  create_product(upc:"99", name:"Plant", price:25, weight:5) {
+    upc
+    name
+    price
+    weight
+  }
+}
