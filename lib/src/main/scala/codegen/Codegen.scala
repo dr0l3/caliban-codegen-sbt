@@ -26,6 +26,7 @@ import java.time.ZonedDateTime
 import java.time.format.DateTimeFormatter
 import java.util.Properties
 import java.util.concurrent.Executor
+import scala.collection.JavaConverters._
 //import codegen.Runner.api
 import fastparse.parse
 import io.circe.optics.JsonPath.root
@@ -245,6 +246,7 @@ case class Column(
       case 12   => ScalaString
       case 1111 => ScalaUUID
       case 93   => ScalaZonedDataTime
+      case 2014 => ScalaInt
     }
 
     if (nullable) ScalaOption(baseType) else baseType
@@ -602,6 +604,8 @@ object Whatever {
       s"update $name set $updates where $where"
     }
   }
+
+
   case class NonPrimaryKeyTable(
       name: String,
       columns: List[Column],
@@ -2643,32 +2647,33 @@ object PostgresSniffer {
   def connToTables2(
       extensions: List[Version2.ObjectExtension]
   )(implicit conn: Connection): List[Whatever.Table] = {
+    println("GETTING TABEL")
     val tablesRs = conn.getMetaData.getTables(null, null, null, Array("TABLE"))
     val tableInfo =
       results(tablesRs)(extractTable).filterNot(_.name.startsWith("hdb"))
-
+    println("GETTING COLUMNS")
     val columnRs = conn.getMetaData.getColumns(null, null, null, null)
     val columnInfo = results(columnRs)(extractColumn)
-
+    println("GETTING PRIMARY KEY INFO")
     val primaryKeyInfo = tableInfo.flatMap { table =>
       val primaryKeyRs = conn.getMetaData.getPrimaryKeys(null, null, table.name)
       results(primaryKeyRs)(extractPrimaryKey)
     }
-
+    println("GETTING INDEXS")
     val indexInfo = tableInfo.flatMap { table =>
       val indexRs =
         conn.getMetaData.getIndexInfo(null, null, table.name, false, true)
       val indexes = results(indexRs)(extractIndexInfo)
       indexes
     }
-
+    println("GETTING FOREIGN KEYSK")
     val exportedKeyInfo = tableInfo.flatMap { table =>
       val exportRs = conn.getMetaData.getExportedKeys(null, null, table.name)
       results(exportRs)(extractExportedKeyinfo)
     }
 
     exportedKeyInfo.foreach(println)
-
+    println("GETTING OTHER KEYS")
     val importedKeyInfo = tableInfo.flatMap { table =>
       val importRs = conn.getMetaData.getImportedKeys(null, null, table.name)
       results(importRs)(extractImportedKeyinfo)

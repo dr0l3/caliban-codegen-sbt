@@ -43,6 +43,7 @@ lazy val lib = project
         case _ => Seq()
       }
     },
+    libraryDependencies += "com.impossibl.pgjdbc-ng" % "pgjdbc-ng" % "0.8.9",
     libraryDependencies += "org.scala-lang.modules" %% "scala-collection-compat" % "2.5.0",
     crossScalaVersions := List("2.12.12", "2.13.6")
   )
@@ -80,6 +81,7 @@ lazy val plugin = project
     organization := "droletours",
     name := "caliban-postgres-sbt",
     libraryDependencies += "org.postgresql" % "postgresql" % "42.2.24",
+    libraryDependencies += "com.impossibl.pgjdbc-ng" % "pgjdbc-ng" % "0.8.9",
     scriptedLaunchOpts := {
       scriptedLaunchOpts.value ++
         Seq("-Xmx1024M", "-Dplugin.version=" + version.value)
