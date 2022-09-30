@@ -1040,6 +1040,20 @@ object Version2 {
     def to__InputValue: __InputValue
 
     def renderSelf: String
+
+    def unwrapped(): ScalaType = {
+      this match {
+        case baseType: BaseType => baseType
+        case containerType: ContainerType =>
+          containerType match {
+            case ScalaOption(inner)    => inner.unwrapped()
+            case ScalaList(inner)      => inner.unwrapped()
+            case AbstractEffect(inner) => inner.unwrapped()
+          }
+        case c: CaseClassType2  => c
+        case TypeReference(tpe) => tpe().unwrapped()
+      }
+    }
   }
 
   object ScalaType {
@@ -2980,20 +2994,37 @@ object Poker extends App {
 object SimplePoker extends App {
   import PostgresSniffer._
   val _ = classOf[org.postgresql.Driver]
-  val con_str = "jdbc:postgresql://0.0.0.0:6875/materialize"
+  val con_str = "jdbc:postgresql://0.0.0.0:5439/postgres"
   implicit val conn =
-    DriverManager.getConnection(con_str, "materialize", null)
+    DriverManager.getConnection(con_str, "postgres", "postgres")
 
 
   val metadata = conn.getMetaData
 
 
 //  println(metadata.getTableTypes)
-  val res = metadata.getColumns(null, "public", null, null)
+//  val res = metadata.getColumns(null, "public", null, null)
 
-  val zomg = results(res)(extractColumn)
+//  val zomg = results(res)(extractColumn)
 
-  println(zomg)
+  val res2 = metadata.getFunctions(null, "public", null)
+
+  val functions = results(res2)(extractFunctions)
+
+
+  val res3 = metadata.getFunctionColumns(null, "public", null, null)
+  val functionColumns = results(res3)(extractFunctionColumns)
+
+
+  functions.foreach(println)
+  println()
+
+  functionColumns.groupBy(_.functionName).foreach { case (fname, cols) =>
+    println(fname)
+    cols.foreach(col => println(s"   ${col}"))
+  }
+
+
 //
 //  val res = metadata.getTableTypes
 
